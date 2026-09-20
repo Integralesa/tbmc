@@ -1,0 +1,248 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Susurro: poder total, fijo a esta cuenta (no se nombra desde la UI).
+    // Araña: rol grantable desde /admin (users/{uid}.role == 'arana'), solo
+    // puede banear y cerrar subastas — nunca tocar planes ni nombrar a
+    // otra Araña. Ver src/lib/roles.js (debe coincidir con esto).
+    function isSusurro() {
+      return request.auth != null
+             && request.auth.token.email == 'theblackmarketconnections@gmail.com';
+    }
+    function isArana() {
+      return request.auth != null
+             && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'arana';
+    }
+    function isStaff() {
+      return isSusurro() || isArana();
+    }
+
+    // Ventana de arrepentimiento del vendedor: los primeros 5 minutos desde
+    // que se publicó, y no aplica a la duración "flash" (10 min). Debe
+    // coincidir con EDIT_WINDOW_MINUTES en src/lib/auctions.js.
+    function withinSellerEditWindow(auction) {
+      return auction.status == 'active'
+             && auction.durationTier != 'flash'
+             && request.time < auction.createdAt + duration.value(5, 'm');
+    }
+
+    match /auctions/{auctionId} {
+      allow read: if true;
+      allow create: if request.auth != null
+                    && request.resource.data.sellerId == request.auth.uid;
+      // Solo permitimos que se actualice vía la transacción de puja
+      // (currentPrice, currentBidderId, currentBidderName, bidCount, endsAt
+      // por la extensión anti-sniping, bidderStreak/lastBidAt por el límite
+      // de pujas seguidas), que el propio vendedor complete el campo images
+      // tras subir las fotos, que Susurro/Araña cierren la subasta a mano, o
+      // que el propio vendedor la edite/cancele dentro de la ventana de
+      // arrepentimiento (ver withinSellerEditWindow) — sin poder tocar
+      // precio ni fotos en la edición, para que no pueda hacer un "cambiazo".
+      allow update: if request.auth != null && (
+        (request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['currentPrice', 'currentBidderId', 'currentBidderName', 'currentBidderWantsNotify', 'bidCount', 'endsAt', 'bidderStreak', 'lastBidAt'])
+          && request.resource.data.sellerId != request.auth.uid)
+        ||
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['images'])
+          && resource.data.sellerId == request.auth.uid)
+        ||
+        (isStaff()
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['status', 'adminCloseReason', 'adminClosedAt', 'endsAt', 'hasFlaggedPhoto']))
+        ||
+        (resource.data.sellerId == request.auth.uid
+          && withinSellerEditWindow(resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['title', 'condition', 'isFoil', 'deliveryMethods', 'deliveryProvince', 'deliveryZone', 'cardShops', 'endsAt', 'editedAt']))
+        ||
+        (resource.data.sellerId == request.auth.uid
+          && withinSellerEditWindow(resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledAt'])
+          && request.resource.data.status == 'cancelled_by_seller')
+      );
+      allow delete: if request.auth != null && resource.data.sellerId == request.auth.uid;
+
+      // Documento de contacto revelado por la Cloud Function al cerrar
+      // una subasta con ganador. Solo lo pueden leer esas dos personas.
+      // La creación es solo del Admin SDK. La actualización SÍ la puede
+      // hacer cada parte, pero únicamente sobre sus propios campos de
+      // confirmación/reporte — nunca sobre los datos de contacto ni sobre
+      // el campo de la otra persona (eso lo recalcula la Cloud Function).
+      match /contact/{docId} {
+        allow read: if request.auth != null
+                    && (request.auth.uid == resource.data.sellerId
+                        || request.auth.uid == resource.data.winnerId);
+        allow update: if request.auth != null && (
+          (request.auth.uid == resource.data.sellerId
+            && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['sellerConfirmed', 'sellerReportedProblem', 'sellerProblemReason']))
+          ||
+          (request.auth.uid == resource.data.winnerId
+            && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['winnerConfirmed', 'winnerReportedProblem', 'winnerProblemReason']))
+        );
+        allow create, delete: if false;
+      }
+    }
+
+    match /bids/{bidId} {
+      allow read: if true;
+      allow create: if request.auth != null
+                    && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Perfil mínimo de cada usuario (nombre, email, foto, teléfono, role).
+    // El dueño solo puede tocar sus propios datos de contacto — NUNCA
+    // plan, planExpiresAt, banned, role, etc. Esos campos son de
+    // Susurro/Araña, así nadie se puede autoactivar un plan, autonombrarse
+    // Araña, o autolevantarse un ban escribiendo directo a Firestore.
+    match /users/{userId} {
+      // Susurro y Arañas pueden leer cualquier perfil (lo necesitan para
+      // moderar: ver email/teléfono en /admin y en el panel de la subasta).
+      allow read: if request.auth != null && (
+        request.auth.uid == userId || isStaff()
+      );
+
+      allow create: if request.auth != null && (
+        (request.auth.uid == userId &&
+          request.resource.data.keys().hasOnly(
+            ['displayName', 'email', 'photoURL', 'phone', 'deliveryPreferences', 'createdAt', 'updatedAt']
+          ))
+        ||
+        isSusurro()
+      );
+
+      allow update: if request.auth != null && (
+        (request.auth.uid == userId &&
+          // "createdAt" a propósito no está acá: solo se escribe una vez, al
+          // crear el documento (ver upsertUserProfile) — nunca en un update,
+          // así nadie puede falsear después su fecha de registro.
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+            ['displayName', 'email', 'photoURL', 'phone', 'deliveryPreferences', 'updatedAt']
+          ))
+        ||
+        isSusurro()
+        ||
+        (isArana()
+          && request.auth.uid != userId
+          && resource.data.email != 'theblackmarketconnections@gmail.com'
+          && resource.data.role != 'arana'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+            ['banned', 'bannedUntil', 'bannedAt', 'banReason', 'strikes']
+          ))
+      );
+
+      allow delete: if isSusurro();
+    }
+
+    // Registro histórico de los sorteos mensuales. Lectura pública (por si
+    // en algún momento se quiere mostrar "ganador del mes" en la web).
+    // Solo lo escribe el Admin SDK desde la Cloud Function del sorteo.
+    match /raffles/{period} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Solicitudes de plan con comprobante ("Informar del trato" en /planes).
+    // Cada usuario solo ve/crea las suyas. Solo Susurro puede aprobarlas o
+    // rechazarlas — las Arañas no tocan planes. Nadie puede borrarlas, para
+    // que quede historial de qué se pidió y qué se resolvió.
+    match /planRequests/{requestId} {
+      allow read: if request.auth != null && (
+        request.auth.uid == resource.data.userId || isSusurro()
+      );
+      allow create: if request.auth != null
+                    && request.resource.data.userId == request.auth.uid
+                    && request.resource.data.status == 'pending';
+      allow update: if isSusurro();
+      allow delete: if false;
+    }
+
+    // Reportes de "hubo un problema" con el motivo escrito por quien
+    // reporta. Cualquiera puede crear el suyo (con reporterId == su propio
+    // uid). Solo Susurro y las Arañas los pueden leer o marcarlos como
+    // revisados — es la "bandeja" que reemplaza al aviso por mail.
+    match /problemReports/{reportId} {
+      allow read: if isStaff();
+      allow create: if request.auth != null
+                    && request.resource.data.reporterId == request.auth.uid
+                    && request.resource.data.status == 'open';
+      allow update: if isStaff();
+      allow delete: if false;
+    }
+
+    // Aviso a Susurro/Arañas cada vez que un vendedor edita una subasta
+    // dentro de la ventana de arrepentimiento (ver auctions/{id} más
+    // arriba). Solo lo crea el propio vendedor de esa edición.
+    match /auctionEdits/{editId} {
+      allow read: if isStaff();
+      allow create: if request.auth != null
+                    && request.resource.data.sellerId == request.auth.uid
+                    && request.resource.data.status == 'open';
+      allow update: if isStaff();
+      allow delete: if false;
+    }
+
+    // Fotos marcadas para revisión por Cloud Vision (ver checkAuctionPhoto
+    // en functions/index.js). Solo las crea el Admin SDK — ningún cliente
+    // puede crear una directamente.
+    match /photoFlags/{flagId} {
+      allow read: if isStaff();
+      allow create: if false;
+      allow update: if isStaff();
+      allow delete: if false;
+    }
+
+    // Formulario de contacto de "Quiénes somos" — no hace falta estar
+    // logueado para escribir. Queda como bandeja para Susurro/Arañas, ya
+    // que no hay sistema de mail armado (ver COMO-FUNCIONA.md).
+    match /contactMessages/{messageId} {
+      allow read: if isStaff();
+      allow create: if request.resource.data.keys().hasOnly(['name', 'email', 'message', 'status', 'createdAt'])
+                    && request.resource.data.status == 'open'
+                    && request.resource.data.email is string
+                    && request.resource.data.message is string
+                    && request.resource.data.message.size() > 0
+                    && request.resource.data.message.size() < 2000;
+      allow update: if isStaff();
+      allow delete: if false;
+    }
+
+    // Locales aprobados para coordinar entrega (ver src/lib/cardShops.js) —
+    // arrancan como sugerencia de un vendedor y Susurro/Arañas los suben
+    // acá. Lectura pública (son un checkbox más al publicar), escritura
+    // solo de moderación.
+    match /cardShops/{shopId} {
+      allow read: if true;
+      allow create, update, delete: if isStaff();
+    }
+
+    // Sugerencias de locales nuevos ("Otras tiendas" en DeliveryFields).
+    // Cualquiera logueado puede crear la suya; solo Susurro/Arañas las ven
+    // y las aprueban/rechazan.
+    match /shopSuggestions/{suggestionId} {
+      allow read: if isStaff();
+      allow create: if request.auth != null
+                    && request.resource.data.reporterId == request.auth.uid
+                    && request.resource.data.status == 'open';
+      allow update: if isStaff();
+      allow delete: if false;
+    }
+
+    // Avisos por usuario (te superaron la puja, cancelaron una subasta en la
+    // que pujaste, terminó tu subasta, ganaste una subasta). Los crea solo
+    // la Cloud Function notifyOnAuctionChange (Admin SDK) — ver
+    // functions/index.js. Cada usuario solo ve los suyos, y solo puede
+    // tocar el campo "read" (para marcarlos como leídos).
+    match /notifications/{notificationId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+      allow create: if false;
+      allow update: if request.auth != null
+                    && request.auth.uid == resource.data.userId
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow delete: if false;
+    }
+  }
+}

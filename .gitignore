@@ -1,0 +1,23 @@
+# Dependencias
+node_modules/
+functions/node_modules/
+
+# Build
+dist/
+functions/lib/
+
+# Firebase local
+.firebase/
+firebase-debug.log
+firebase-debug.*.log
+ui-debug.log
+
+# Entorno / secretos (por si alguna vez se agrega uno)
+.env
+.env.local
+.env.*.local
+
+# Herramientas locales / editor
+.claude/
+.vscode/
+.DS_Store

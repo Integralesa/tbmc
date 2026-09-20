@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "tbmc-1bd19"
+  },
+  "targets": {
+    "tbmc-1bd19": {
+      "hosting": {
+        "main": [
+          "theblackmarketconnections"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}
