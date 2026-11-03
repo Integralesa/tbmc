@@ -3,7 +3,7 @@
   "description": "Cloud Functions para Sala de Subastas",
   "private": true,
   "engines": {
-    "node": "18"
+    "node": "22"
   },
   "main": "index.js",
   "type": "commonjs",
