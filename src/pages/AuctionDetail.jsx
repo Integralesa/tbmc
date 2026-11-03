@@ -158,7 +158,7 @@ export default function AuctionDetail() {
 
   return (
     <div className="max-w-5xl mx-auto px-6 py-10 grid md:grid-cols-2 gap-10">
-      {/* Galería — hasta 2 fotos */}
+      {/* Galería — hasta 6 fotos */}
       <div>
         <div
           className={`aspect-[3/4] bg-panel border flex items-center justify-center overflow-hidden ${
@@ -299,6 +299,16 @@ export default function AuctionDetail() {
           {auction.isFoil && (
             <span className="text-xs uppercase tracking-wide px-2 py-1 bg-brass text-ink font-semibold">
               Foil
+            </span>
+          )}
+          {auction.isGraded && (
+            <span className="text-xs uppercase tracking-wide px-2 py-1 bg-ink border border-brass text-brass font-semibold">
+              {auction.gradingCompany} {auction.grade}
+            </span>
+          )}
+          {auction.sealIntact && (
+            <span className="text-xs uppercase tracking-wide px-2 py-1 bg-ink border border-brass text-brass font-semibold">
+              🔒 Sello intacto
             </span>
           )}
         </h1>

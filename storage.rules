@@ -1,9 +1,56 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
+    // Cualquier usuario logueado puede escribir en la carpeta de CUALQUIER
+    // subasta, no solo la propia — es una debilidad real conocida (ver
+    // COMO-FUNCIONA.md): se intentó cerrar validando el dueño contra el
+    // documento de la subasta en Firestore (`firestore.get`), pero ese
+    // permiso especial entre Storage y Firestore no terminó de activarse
+    // en este entorno y bloqueaba también las subidas legítimas — se
+    // revirtió para no romper la publicación de cartas. Pendiente:
+    // reintentarlo una vez habilitado el permiso cruzado desde la consola
+    // de Firebase (Storage → Rules, al guardar una regla con firestore.get
+    // debería pedir confirmarlo).
     match /auctions/{auctionId}/{fileName} {
       allow read: if true;
       allow write: if request.auth != null
+                   && request.resource.size < 8 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Fotos de "Mercado" (bazaar tipo grupo de compraventa) — mismo criterio
+    // (y misma debilidad conocida) que auctions/{auctionId}/{fileName} de
+    // arriba: cualquier logueado puede escribir en la carpeta de cualquier
+    // publicación, no reforzado contra el dueño real por la misma limitación
+    // de firestore.get() entre Storage y Firestore en este entorno.
+    match /market/{listingId}/{fileName} {
+      allow read: if true;
+      allow write: if request.auth != null
+                   && request.resource.size < 8 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Fotos y videos cortos del catálogo "Workbench" (impresiones 3D y
+    // otros productos a pedido de TBMC, ver COMO-FUNCIONA.md) — a
+    // diferencia de auctions/market de arriba, acá SÍ se puede restringir
+    // bien al dueño real porque solo Susurro sube contenido (no es un
+    // catálogo que arme cualquier usuario), simple chequeo de email, sin
+    // necesitar firestore.get() entre servicios.
+    match /workbench/{productId}/{fileName} {
+      allow read: if true;
+      allow write: if request.auth != null
+                   && request.auth.token.email == 'theblackmarketconnections@gmail.com'
+                   && request.resource.size < 40 * 1024 * 1024
+                   && (request.resource.contentType.matches('image/.*')
+                       || request.resource.contentType.matches('video/.*'));
+    }
+
+    // Foto de la carta del sorteo bounty (ver COMO-FUNCIONA.md) — solo
+    // Susurro la sube, pública para que se vea en el home.
+    match /bountyRaffles/{raffleId}/{fileName} {
+      allow read: if true;
+      allow write: if request.auth != null
+                   && request.auth.token.email == 'theblackmarketconnections@gmail.com'
                    && request.resource.size < 8 * 1024 * 1024
                    && request.resource.contentType.matches('image/.*');
     }

@@ -1,8 +1,31 @@
-import { collection, doc, getDoc, getDocs, query, setDoc, Timestamp, where } from 'firebase/firestore'
+import { collection, deleteDoc, doc, getDoc, getDocs, increment, query, setDoc, Timestamp, where } from 'firebase/firestore'
 import { db } from '../firebase'
 import { SUSURRO_EMAIL } from './roles'
-import { getActiveStrikes } from './users'
+import {
+  getActiveStrikes,
+  REP_WEIGHT_BIDDER_STRIKE,
+  REP_WEIGHT_SELLER_STRIKE,
+} from './users'
 import { getDurationTier } from './auctions'
+
+/**
+ * Cuentas sin email (`email: null`) — es la firma de una sesión anónima
+ * (ver upsertUserProfile en lib/users.js, que guarda `email: user.email ||
+ * null`). Se usa para encontrar y limpiar las cuentas de prueba que deja
+ * cada ronda de testing con Playwright/signInAnonymously, que si no se
+ * borran se acumulan y aparecen en "Últimos registrados". Solo Susurro
+ * puede leer el listado completo de usuarios (ver firestore.rules).
+ */
+export async function findAnonymousTestUsers() {
+  const q = query(collection(db, 'users'), where('email', '==', null))
+  const snap = await getDocs(q)
+  return snap.docs.map((d) => ({ id: d.id, ...d.data() }))
+}
+
+/** Borra el documento de perfil de un usuario. Solo Susurro (ver firestore.rules). */
+export async function deleteUserDoc(uid) {
+  await deleteDoc(doc(db, 'users', uid))
+}
 
 /** Busca el perfil de un usuario por email exacto. Devuelve null si no existe. */
 export async function findUserByEmail(email) {
@@ -96,6 +119,17 @@ export async function closeAuctionByAdmin(auctionId, reason) {
 }
 
 /**
+ * Borra una subasta sin importar su estado ni si tuvo pujas — solo
+ * Susurro (ver firestore.rules). Pensado para limpiar pruebas viejas que
+ * quedaron con pujas falsas dando vueltas para siempre (la protección
+ * normal de "nunca se borra si tuvo pujas" sigue intacta para todos los
+ * demás casos — esto es la excepción manual y deliberada).
+ */
+export async function deleteAuctionByAdmin(auctionId) {
+  await deleteDoc(doc(db, 'auctions', auctionId))
+}
+
+/**
  * Aprueba una subasta que quedó "en revisión" porque Cloud Vision marcó
  * alguna de sus fotos (ver checkAuctionPhoto y photoFlags) — la pasa a
  * 'active' y le da la duración completa desde este momento (no desde que
@@ -147,8 +181,14 @@ export async function rejectPlanRequest(requestId, note = '') {
  *   4to (activo)        → suspensión automática de 7 días.
  *   5to en adelante     → suspensión permanente.
  * Devuelve el nuevo total de strikes activos.
+ *
+ * `role` ('seller' | 'bidder') es quién de los dos incumplió en esa subasta
+ * puntual — lo decide quien modera al mirar el reporte (ver Admin.jsx). Se
+ * usa para restar puntaje de reputación (getReputationScore en lib/users.js);
+ * el strike en sí (para la escalada de suspensión de arriba) no distingue rol,
+ * eso no cambia.
  */
-export async function addStrike(uid) {
+export async function addStrike(uid, role) {
   const userRef = doc(db, 'users', uid)
   const snap = await getDoc(userRef)
   const current = snap.exists() ? snap.data() : {}
@@ -156,7 +196,13 @@ export async function addStrike(uid) {
   const newStrikes = [...activeStrikes, Timestamp.now()]
   const newCount = newStrikes.length
 
-  const update = { strikes: newStrikes }
+  const strikeWeight = role === 'seller' ? REP_WEIGHT_SELLER_STRIKE : REP_WEIGHT_BIDDER_STRIKE
+  const update = {
+    strikes: newStrikes,
+    repNumerator: increment(1 * strikeWeight),
+    repDenominator: increment(strikeWeight),
+    repOpsCount: increment(1),
+  }
 
   if (newCount === 3) {
     update.banned = true

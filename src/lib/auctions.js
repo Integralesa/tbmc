@@ -20,8 +20,9 @@ import {
 } from 'firebase/storage'
 import { db, storage } from '../firebase'
 import { startOfTodayInArgentina, getPlan } from './plans'
-import { isUserBanned } from './users'
+import { getPublicName, isUserBanned } from './users'
 import { compressImage } from './image'
+import { findMatchingWishlists, createMatchNotifications } from './wishlistMatching'
 
 const AUCTIONS = 'auctions'
 const BIDS = 'bids'
@@ -29,22 +30,27 @@ const BIDS = 'bids'
 // ---------- Modelo de datos ----------
 // auctions/{id}: {
 //   title, game, condition, isFoil,
-//   itemType: 'card' | 'singles' | 'lote' | 'sleeves' | 'deckbox' | 'set_cartas' | 'board_game', // 'card' = carta individual (default); 'singles' es igual pero con la etiqueta explícita
+//   itemType: 'card' | 'singles' | 'lote' | 'sleeves' | 'deckbox' | 'set_cartas' | 'board_game' | 'sealed', // 'card' = carta individual (default); 'singles' es igual pero con la etiqueta explícita
 //   loteQuantity, loteSets, loteSetsVariados,  // solo si itemType === 'lote' — ver CreateAuction
+//   sealIntact: bool | null,               // solo si itemType === 'sealed' — sello de fábrica intacto
+//   isGraded, gradingCompany, grade,       // graduación de terceros (PSA/BGS/CGC), opcional
 //   deliveryMethods, deliveryProvince, deliveryZone, cardShops, cardShopOtherName,
-//   images: [urlFoto1, urlFoto2],   // hasta 2 fotos
+//   images: [urlFoto1, ..., urlFoto6],   // hasta 6 fotos
 //   sellerId, sellerName, sellerPhoto,
 //   startingPrice, currentPrice,
 //   currentBidderId, currentBidderName, currentBidderWantsNotify, bidCount,
 //   status: 'pending_review' | 'active' | 'ended' | 'closed_by_admin' | 'cancelled_by_seller',
 //   photosTotal, photosChecked, hasFlaggedPhoto, // ver checkAuctionPhoto (Cloud Function)
-//   durationTier: 'flash' | '30min' | '2h' | '5h' | '12h' | '24h',
+//   durationTier: 'flash' | '30min' | '2h' | '5h' | '12h' | '24h' | '7d',
 //   extendWindowMinutes, extendByMinutes,  // config anti-sniping de esta subasta
 //   fixedBidIncrement: number | null,      // si está seteado, el comprador puja con un botón único
 //   endsAt: Timestamp, createdAt: Timestamp,
 //   editedAt: Timestamp | undefined,       // si el vendedor la corrigió en la ventana de 5 min
 //   cancelledAt: Timestamp | undefined,    // si el vendedor la canceló en la ventana de 5 min
 // }
+// "Republicar" (ver republishAuction) NO crea una subasta nueva — reactiva
+// el mismo documento (status: 'ended' → 'active' de nuevo), para que no
+// aparezca duplicada en "Mis subastas".
 // bids/{id}: { auctionId, userId, userName, userPhoto, amount, createdAt }
 
 // ---------- Duración + anti-sniping ----------
@@ -61,13 +67,20 @@ export const DURATION_TIERS = [
   { key: '5h', label: '5 horas', minutes: 300, extendWindowMinutes: 10, extendByMinutes: 10, minPlanPriority: 0 },
   { key: '12h', label: '12 horas', minutes: 720, extendWindowMinutes: 10, extendByMinutes: 10, minPlanPriority: 1 },
   { key: '24h', label: '24 horas', minutes: 1440, extendWindowMinutes: 10, extendByMinutes: 10, minPlanPriority: 2 },
+  // Franja larga para objetos puntuales/raros que necesitan más tiempo
+  // para encontrar comprador (idea tomada de cómo se manejan las casas de
+  // subastas japonesas) — a propósito solo para el plan más alto: las
+  // franjas cortas de arriba se mantienen como están (se acortaron adrede
+  // en su momento para evitar sniping y que el sitio no se sienta
+  // "parado"), y la duración sigue siendo parte de lo que se paga.
+  { key: '7d', label: '7 días — objetos puntuales', minutes: 10080, extendWindowMinutes: 10, extendByMinutes: 10, minPlanPriority: 2 },
 ]
 
 export function getDurationTier(key) {
   return DURATION_TIERS.find((t) => t.key === key) || DURATION_TIERS[0]
 }
 
-const MAX_PHOTOS = 2
+const MAX_PHOTOS = 6
 export const MAX_PRICE_DIGITS = 18 // tope contra números absurdos (ej: un cero de más al escribir el precio)
 export const MIN_BID_AMOUNT = 500 // piso de la puja libre — no aplica a puja con incremento fijo
 
@@ -115,7 +128,7 @@ export async function countTodayAuctionsByUser(userId) {
   return snap.data().count
 }
 
-/** Sube hasta 2 fotos de la carta a Storage, comprimidas, y devuelve sus URLs. */
+/** Sube hasta 6 fotos de la carta a Storage, comprimidas, y devuelve sus URLs. */
 async function uploadAuctionImages(auctionId, files) {
   const limited = files.slice(0, MAX_PHOTOS)
   const urls = []
@@ -128,6 +141,35 @@ async function uploadAuctionImages(auctionId, files) {
     urls.push(url)
   }
   return urls
+}
+
+/**
+ * Resube las fotos de una subasta propia, reemplazando las que tenga —
+ * pensado como herramienta de reparación (ej: fotos que quedaron rotas
+ * por el incidente de carpetas huérfanas de Storage, ver COMO-FUNCIONA.md),
+ * no como forma normal de editar. Solo funciona mientras bidCount sigue en
+ * 0 (reforzado también en firestore.rules): una vez que hay pujas, nadie
+ * puede tocar las fotos, para que no se preste a un "cambiazo".
+ */
+export async function replaceAuctionImages({ auctionId, imageFiles, user }) {
+  if (!user) throw new Error('Tenés que iniciar sesión.')
+  if (!imageFiles || imageFiles.length === 0) {
+    throw new Error('Subí al menos 1 foto.')
+  }
+  if (imageFiles.length > MAX_PHOTOS) {
+    throw new Error(`Máximo ${MAX_PHOTOS} fotos por carta.`)
+  }
+  const snap = await getDoc(doc(db, AUCTIONS, auctionId))
+  if (!snap.exists()) throw new Error('La subasta ya no existe.')
+  const auction = snap.data()
+  if (auction.sellerId !== user.uid) throw new Error('Esta subasta no es tuya.')
+  if ((auction.bidCount || 0) > 0) {
+    throw new Error('Ya tiene pujas — no se pueden cambiar las fotos de una subasta con pujas.')
+  }
+
+  const images = await uploadAuctionImages(auctionId, imageFiles)
+  await updateDoc(doc(db, AUCTIONS, auctionId), { images })
+  return images
 }
 
 /**
@@ -145,6 +187,10 @@ export async function createAuction({
   loteQuantity,
   loteSets,
   loteSetsVariados,
+  sealIntact,
+  isGraded,
+  gradingCompany,
+  grade,
   startingPrice,
   durationTierKey,
   fixedBidIncrement,
@@ -198,13 +244,21 @@ export async function createAuction({
     loteQuantity: itemType === 'lote' && loteQuantity ? Number(loteQuantity) : null,
     loteSets: itemType === 'lote' ? loteSets || [] : [],
     loteSetsVariados: itemType === 'lote' ? !!loteSetsVariados : false,
+    // Inspirado en cómo se manejan las casas de subastas japonesas (ver
+    // COMO-FUNCIONA.md): el sello intacto importa mucho para sellados, y
+    // la graduación de terceros (PSA/BGS/CGC) le da confianza extra a
+    // cartas de alto valor.
+    sealIntact: itemType === 'sealed' ? !!sealIntact : null,
+    isGraded: !!isGraded,
+    gradingCompany: isGraded ? gradingCompany || null : null,
+    grade: isGraded && grade ? Number(grade) : null,
     deliveryMethods: deliveryMethods || [], // ej: ['retiro', 'envio', 'punto_encuentro']
     deliveryProvince: deliveryProvince || null, // ej: "Ciudad Autónoma de Buenos Aires", "Córdoba"
     deliveryZone: deliveryZone || null, // barrio de CABA, o "Partido (CP 1425)" si la provincia es Buenos Aires
     cardShops: cardShops || [], // ej: ['magic_palace', 'otras']
     images: [],
     sellerId: user.uid,
-    sellerName: user.displayName || 'Vendedor',
+    sellerName: getPublicName(profileSnap.exists() ? profileSnap.data() : null, user),
     sellerPhoto: user.photoURL || null,
     sellerPlan: plan.key, // snapshot del plan al momento de publicar (define si aparece destacado)
     sellerPlanPriority: plan.priority || 0, // 0 chusma, 1 informante, 2 intel de pícaros
@@ -235,7 +289,81 @@ export async function createAuction({
     tx.update(doc(db, AUCTIONS, docRef.id), { images })
   })
 
+  // Buscar y notificar a usuarios que buscan esta carta (no bloqueante)
+  if (title) {
+    findMatchingWishlists(title, null, null, 1).then((matches) => {
+      if (matches.length > 0) {
+        createMatchNotifications(docRef.id, title, null, null, 1, matches)
+      }
+    })
+  }
+
   return docRef.id
+}
+
+/**
+ * Republica una subasta propia que ya cerró sin ninguna puja — evita tener
+ * que volver a cargar título, fotos, entrega, etc. desde cero. A propósito
+ * NO crea una subasta nueva (antes sí, y eso la hacía aparecer duplicada
+ * en "Mis subastas" — la vieja cerrada y la nueva activa, como dos cosas
+ * distintas): reactiva el MISMO documento, así en el perfil sigue siendo
+ * un solo ítem que pasó de "Cerrada" a "Activa" de nuevo. Reutiliza las
+ * fotos ya subidas (siguen en Storage, nunca se borran) — por eso pasa
+ * directo a `status: 'active'`, esas fotos ya pasaron el chequeo de Cloud
+ * Vision la primera vez. El precio inicial queda igual que la vez pasada;
+ * la duración por default es la misma de antes, pero se puede pasar
+ * `durationTierKey` para elegir otra (ej: republicar algo que antes
+ * estaba a 24h, ahora a 7 días) — sigue estando sujeta al plan del
+ * vendedor, igual que al publicar de cero.
+ */
+export async function republishAuction({ auctionId, user, durationTierKey }) {
+  if (!user) throw new Error('Tenés que iniciar sesión.')
+  const snap = await getDoc(doc(db, AUCTIONS, auctionId))
+  if (!snap.exists()) throw new Error('La subasta ya no existe.')
+  const old = snap.data()
+  if (old.sellerId !== user.uid) throw new Error('Esta subasta no es tuya.')
+  if (old.status !== 'ended' || (old.bidCount || 0) > 0) {
+    throw new Error('Solo se pueden republicar subastas cerradas sin ninguna puja.')
+  }
+  if (!old.images || old.images.length === 0) {
+    throw new Error('Esta subasta no tiene fotos guardadas para reutilizar.')
+  }
+
+  // Mismos chequeos que al publicar de cero: cuenta suspendida, límite
+  // diario del plan, y que el plan alcance para la duración original.
+  const profileSnap = await getDoc(doc(db, 'users', user.uid))
+  if (profileSnap.exists() && isUserBanned(profileSnap.data())) {
+    throw new Error('Tu cuenta está suspendida y no podés publicar cartas. Escribinos si creés que es un error.')
+  }
+  const planKey = profileSnap.exists() ? profileSnap.data().plan : 'free'
+  const plan = getPlan(planKey)
+  const todayCount = await countTodayAuctionsByUser(user.uid)
+  if (todayCount >= plan.dailyLimit) {
+    throw new Error(
+      `Llegaste al límite de tu plan (${plan.label}: ${plan.dailyLimit} publicaciones por día). Mirá los planes para subir el límite.`,
+    )
+  }
+  const tier = getDurationTier(durationTierKey || old.durationTier)
+  if (tier.minPlanPriority > plan.priority) {
+    throw new Error(
+      `La duración "${tier.label}" requiere un plan mejor que ${plan.label}. Mirá los planes para desbloquearla.`,
+    )
+  }
+  const endsAt = new Date(Date.now() + tier.minutes * 60 * 1000)
+
+  await updateDoc(doc(db, AUCTIONS, auctionId), {
+    status: 'active',
+    currentPrice: old.startingPrice,
+    currentBidderId: null,
+    currentBidderName: null,
+    bidCount: 0,
+    endsAt,
+    durationTier: tier.key,
+    extendWindowMinutes: tier.extendWindowMinutes,
+    extendByMinutes: tier.extendByMinutes,
+  })
+
+  return auctionId
 }
 
 /**
@@ -489,6 +617,7 @@ export async function placeBid({ auctionId, amount, user, notifyIfOutbid = true 
   if (profileSnap.exists() && isUserBanned(profileSnap.data())) {
     throw new Error('Tu cuenta está suspendida y no podés pujar. Escribinos si creés que es un error.')
   }
+  const bidderName = getPublicName(profileSnap.exists() ? profileSnap.data() : null, user)
 
   await runTransaction(db, async (tx) => {
     const auctionRef = doc(db, AUCTIONS, auctionId)
@@ -558,7 +687,7 @@ export async function placeBid({ auctionId, amount, user, notifyIfOutbid = true 
     tx.update(auctionRef, {
       currentPrice: Number(amount),
       currentBidderId: user.uid,
-      currentBidderName: user.displayName || 'Comprador',
+      currentBidderName: bidderName,
       currentBidderWantsNotify: !!notifyIfOutbid,
       bidCount: (auction.bidCount || 0) + 1,
       endsAt: newEndsAt,
@@ -570,7 +699,7 @@ export async function placeBid({ auctionId, amount, user, notifyIfOutbid = true 
     tx.set(newBidRef, {
       auctionId,
       userId: user.uid,
-      userName: user.displayName || 'Comprador',
+      userName: bidderName,
       userPhoto: user.photoURL || null,
       amount: Number(amount),
       createdAt: serverTimestamp(),

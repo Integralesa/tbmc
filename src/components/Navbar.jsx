@@ -3,10 +3,13 @@ import { Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { isStaff } from '../lib/roles'
 import NotificationBell from './NotificationBell'
+import NotificationBadge from './NotificationBadge'
+import PublishAuctionModal from './PublishAuctionModal'
 
 export default function Navbar() {
   const { user, profile, loginWithGoogle, logout } = useAuth()
   const [menuOpen, setMenuOpen] = useState(false)
+  const [publishModalOpen, setPublishModalOpen] = useState(false)
 
   const linkClass = 'text-sm text-parchment/80 hover:text-brass transition-colors'
 
@@ -18,20 +21,9 @@ export default function Navbar() {
       <Link to="/" onClick={() => setMenuOpen(false)} className={linkClass}>
         Subastas
       </Link>
-      <Link to="/planes" onClick={() => setMenuOpen(false)} className={linkClass}>
-        Planes
+      <Link to="/buscar" onClick={() => setMenuOpen(false)} className={linkClass}>
+        Buscar
       </Link>
-      <Link to="/nosotros" onClick={() => setMenuOpen(false)} className={linkClass}>
-        ¿Tenés una sugerencia?
-      </Link>
-      <Link to="/terminos" onClick={() => setMenuOpen(false)} className={linkClass}>
-        Antes de subastar o ofertar, leé esto
-      </Link>
-      {user && (
-        <Link to="/publicar" onClick={() => setMenuOpen(false)} className={linkClass}>
-          Publicar
-        </Link>
-      )}
       {isStaff(user, profile) && (
         <Link
           to="/admin"
@@ -46,6 +38,12 @@ export default function Navbar() {
 
   const authSection = user ? (
     <div className="flex items-center gap-3">
+      <button
+        onClick={() => setPublishModalOpen(true)}
+        className="text-sm font-medium px-4 py-2 rounded-sm bg-brass text-ink hover:bg-brassHigh transition-colors"
+      >
+        Publicar
+      </button>
       <Link to="/perfil" onClick={() => setMenuOpen(false)} className="flex items-center gap-2 group">
         {user.photoURL && (
           <img
@@ -81,17 +79,19 @@ export default function Navbar() {
   )
 
   return (
-    <header className="border-b border-panelLine relative">
-      <div className="max-w-5xl mx-auto px-6 py-5 flex items-center justify-between md:justify-end gap-4">
+    <header className="relative">
+      <div className="max-w-5xl mx-auto px-6 py-5 flex items-center justify-between md:justify-end gap-4 border-b border-panelLine">
         {/* Escritorio: todo en una fila */}
         <nav className="hidden md:flex items-center gap-6">
           {pageLinks}
+          {user && <NotificationBadge />}
           {user && <NotificationBell />}
           {authSection}
         </nav>
 
         {/* Celular: campanita (si hay sesión) + botón de menú compacto */}
         <div className="flex md:hidden items-center gap-3 ml-auto">
+          {user && <NotificationBadge />}
           {user && <NotificationBell />}
           <button
             type="button"
@@ -111,6 +111,7 @@ export default function Navbar() {
           <div className="pt-2 border-t border-panelLine">{authSection}</div>
         </div>
       )}
+      <PublishAuctionModal isOpen={publishModalOpen} onClose={() => setPublishModalOpen(false)} />
     </header>
   )
 }

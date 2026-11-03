@@ -64,6 +64,16 @@ export default function AuctionCard({ auction, lotNumber }) {
               Foil
             </span>
           )}
+          {auction.isGraded && (
+            <span className="text-[9px] uppercase tracking-wide px-1.5 py-0.5 bg-ink border border-brass text-brass font-semibold shrink-0">
+              {auction.gradingCompany} {auction.grade}
+            </span>
+          )}
+          {auction.sealIntact && (
+            <span className="text-[9px] uppercase tracking-wide px-1.5 py-0.5 bg-ink border border-brass text-brass font-semibold shrink-0">
+              🔒 Sellado
+            </span>
+          )}
         </h3>
         <div className="flex items-end justify-between pt-1">
           <div>

@@ -145,6 +145,61 @@ Sin definir todavía: qué pasa con calificaciones injustas/de mala fe, si se
 pueden editar o eliminar, y si el ranking pesa más por rating promedio o por
 volumen de operaciones.
 
+## 7.1. Sorteo bounty (carta puntual, activado a mano, con referidos)
+
+Distinto del sorteo mensual (sección 8, automático y periódico, reparte
+planes): este es un evento puntual que **Susurro activa cuando quiere**,
+sortea una **carta concreta** que él mismo carga, y premia a quien trae
+gente nueva al sitio.
+
+- **Crear**: desde `/admin` (solo Susurro), se carga el título y la foto de
+  la carta — queda en `bountyRaffles/{id}` con `status: 'draft'`,
+  invisible en el sitio.
+- **Activar**: un botón lo pasa a `status: 'active'` — ahí aparece en el
+  home, arriba de todo, con borde dorado y un ícono 💰 ("Sorteo bounty").
+  Como referencia (no como bloqueo automático) se muestra en `/admin`
+  cuántas personas distintas pujaron alguna vez en el sitio, para tener
+  una idea de si ya se llegó a las ~40 que se pensaron como piso informal.
+- **Invitar gente**: cualquier usuario logueado tiene un link personal
+  (`.../?ref=SU_UID` — el código de invitación es directamente su uid, no
+  hace falta generar uno aparte) que se muestra en la misma tarjeta del
+  home mientras el sorteo está activo, con botón de copiar. Si alguien
+  entra al sitio por ese link y se registra por primera vez, su perfil
+  queda con `referredBy` cargado — una sola vez, al crear la cuenta,
+  nunca después (ver `upsertUserProfile` en `src/lib/users.js` y
+  `src/lib/referrals.js`).
+- **Puntos, a prueba de trampas**: sumar puntos a otra persona (a quien te
+  invitó) no puede resolverse con una escritura común del cliente —
+  nadie debería poder acreditarse puntos a sí mismo ni a un cómplice
+  escribiendo directo a Firestore. Por eso corre por dos Cloud Functions
+  (Admin SDK, `functions/index.js`):
+  - `awardReferralSignupBonus`: se dispara al crearse cualquier cuenta
+    nueva. Si tiene `referredBy`, le suma **+1 punto** a quien invitó.
+  - `awardReferralBidBonus`: se dispara con cada puja nueva. Si es la
+    **primera puja de siempre** de esa persona (se marca con
+    `hasBid: true` en su perfil, dato que también usa el contador de
+    "gente pujando" de arriba) y tiene `referredBy`, le suma **+2 puntos
+    más** a quien invitó — más que por el simple registro, para premiar
+    más a quien trae gente que realmente participa.
+  - **Importante**: los puntos **solo se acreditan si hay un sorteo bounty
+    activo en ese momento** — no se acumulan para siempre. Cada sorteo
+    nuevo arranca de cero: los puntos de cada uno viven en
+    `bountyRaffles/{id}/entries/{uid}`, una subcolección aparte por
+    sorteo, de solo lectura para el cliente (ni siquiera el dueño de los
+    puntos los puede leer — el campo `hasBid` tampoco es tocable por el
+    cliente en ningún caso).
+- **Sortear**: con el sorteo activo, un botón "Sortear ganador" en
+  `/admin` arma la lista de entradas — 1 entrada base por cada usuario
+  registrado, más las que haya sumado por sus referidos en ese sorteo
+  puntual — y elige al azar. El sorteo en sí corre del lado del cliente
+  (no en una Cloud Function aparte) porque quien lo dispara ya está
+  protegido por `firestore.rules` (solo Susurro). Al cerrar, queda
+  `status: 'closed'` con `winnerId`/`winnerName`/`totalEntries`.
+
+No está resuelto todavía: cómo se le entrega la carta al ganador en la
+práctica (coordinación manual, fuera del sitio, como cualquier operación) —
+a propósito no se mete con envíos ni pagos, igual que el resto del sitio.
+
 ## 8. Planes / suscripciones
 
 El límite es **solo para publicar** — pujar es y va a seguir siendo ilimitado
@@ -703,6 +758,38 @@ listener en tiempo real por cada una" se compartía entre pestañas, así que
 se extrajo a un hook reusable (`useMyBidAuctions`, en `src/hooks/`) — lo
 usan tanto "Mis pujas" y "Subastas ganadas" como el aviso de la sección 22.
 
+### 23.1. Republicar una subasta cerrada sin pujas
+
+En "Mis subastas", cada subasta que **cerró sin ninguna puja**
+(`status: 'ended'` y `bidCount` en 0 o sin cargar) tiene un botón
+**"Republicar"** — evita tener que cargar de nuevo título, fotos, entrega,
+etc. desde cero para volver a intentar venderla.
+
+- `republishAuction` (`src/lib/auctions.js`) **no crea una subasta
+  nueva** — reactiva el mismo documento (`status: 'ended'` → `'active'`
+  de nuevo, con el precio y el contador de pujas reseteados). Título,
+  fotos, entrega, etc. quedan tal cual estaban, sin tocarlos. Esto es a
+  propósito: la primera versión sí creaba una subasta nueva, y eso hacía
+  que apareciera **duplicada** en "Mis subastas" (la vieja "Cerrada" y la
+  nueva "Activa" como dos ítems distintos) — se cambió para que siga
+  siendo un solo ítem en la lista, que simplemente vuelve a estar activo.
+- **Reutiliza las fotos ya subidas** — siguen accesibles en Storage
+  (nunca se borran) — y por eso vuelve a `status: 'active'` directo, **sin
+  pasar por "en revisión"**: esas mismas fotos ya pasaron el chequeo de
+  Cloud Vision la primera vez (sección 24), no hace falta chequearlas de
+  nuevo.
+- Pasa por los mismos chequeos que publicar de cero: cuenta no
+  suspendida, límite diario del plan, y que el plan alcance para la
+  duración original (por si el plan bajó de categoría desde la primera
+  publicación) — estos siguen siendo controles del lado del cliente, no
+  reforzados en `firestore.rules` (mismo criterio que el límite diario en
+  general, ver sección 26.1).
+- Solo aplica a subastas cerradas **sin pujas** — si tuvo aunque sea una
+  puja, no se puede republicar así (esa operación quedó registrada, no
+  tiene sentido "reiniciarla" como si nada hubiera pasado). Reforzado en
+  `firestore.rules`: la subasta tiene que estar `'ended'` con `bidCount`
+  en 0 para poder pasar a `'active'` por esta vía.
+
 ## 24. Chequeo automático de fotos (Cloud Vision)
 
 Para evitar que se publique una carta con una foto que en realidad es de
@@ -788,6 +875,302 @@ una bandeja más en `/admin` ("✉️ Mensajes de contacto"), visible para
 Susurro y Arañas, con un botón "Responder por mail" que abre el cliente de
 correo de quien modera hacia el email que dejó la persona. No hace falta
 estar logueado para mandar el formulario.
+
+## 26.1. Revisión de seguridad (septiembre 2026)
+
+Se hizo una revisión completa de `firestore.rules`, `storage.rules` y las
+Cloud Functions. Hasta ese momento, buena parte de la lógica de negocio
+(límite diario del plan, qué duración permite cada plan, validación de
+pujas, moderación de fotos) vivía **solo en el código del sitio**, no
+reforzada del lado del servidor — cualquiera con conocimientos técnicos
+básicos podía saltarse el formulario y escribir directo a Firestore con
+el SDK de Firebase. Se encontraron y corrigieron tres problemas serios:
+
+- **Crear una subasta ya "activa", saltándose la revisión de fotos**:
+  antes, `allow create` en `auctions` solo pedía que `sellerId` fuera el
+  propio uid — nada impedía publicar directo con `status: 'active'`,
+  cualquier precio/duración, fotos externas inventadas, o hasta
+  `sellerPlanPriority: 2` para aparecer "Destacado" sin pagar ningún
+  plan. Ahora la regla exige que toda subasta nueva nazca sin pujas, con
+  el precio actual igual al inicial, y en uno de dos estados válidos:
+  `pending_review` normal, o `active` **solo** si viene de "Republicar"
+  (sección 23.1) — y en ese caso se valida contra la subasta original de
+  verdad (misma dueña, cerrada, sin pujas, mismas fotos) antes de
+  permitirlo.
+- **Pujar como si fueras otra persona**: la regla que permite actualizar
+  `currentBidderId`/`currentPrice`/`bidCount` no exigía que quien puja se
+  esté marcando a sí mismo — cualquiera podía poner el uid de OTRA
+  persona como si estuviera ganando, sin que esa persona hubiera pujado
+  nunca. Como al cerrar la subasta se le revela el contacto (email,
+  teléfono) al vendedor, esto se podía usar para conseguir los datos de
+  alguien sin su consentimiento. Ahora la regla exige `currentBidderId ==`
+  el propio uid de quien escribe, que el precio nuevo sea mayor al
+  anterior, y que `bidCount` suba de a uno.
+- **Borrar una subasta cerrada sin ninguna restricción**: el vendedor
+  podía borrar cualquier subasta propia en cualquier momento, incluso una
+  ya cerrada con comprador y contacto revelado — se podía usar para
+  "borrar evidencia" de una operación en disputa. Ahora solo se puede
+  borrar una subasta propia si nunca tuvo ninguna puja.
+
+**Pendiente, aceptado por ahora**: cualquier usuario logueado puede
+escribir en la carpeta de Storage de **cualquier** subasta, no solo la
+propia (ver el comentario en `storage.rules`). Se intentó cerrar esto
+validando el dueño contra Firestore desde las reglas de Storage
+(`firestore.get`), pero ese permiso especial entre los dos servicios no
+terminó de activarse en este entorno y bloqueaba también las subidas
+legítimas — se revirtió para no romper la publicación de cartas. Falta
+reintentarlo confirmando el permiso cruzado desde la consola de Firebase.
+
+**Pendiente, fuera del alcance de las reglas**: la autenticación anónima
+está habilitada en el proyecto (se activó para poder probar cosas en
+este mismo chat) — mientras siga activa, cualquier visitante puede
+crearse cuentas descartables sin registrarse de verdad, lo que le resta
+sentido a los bans, al límite diario por plan, y a la integridad de los
+puntos del sorteo bounty (sección 7.1). Conviene desactivarla desde la
+consola de Firebase (Authentication → Sign-in method → Anonymous) en
+cuanto no haga falta seguir probando con ella.
+
+## 26.2. Nombre de usuario
+
+En `/perfil`, debajo del plan, hay un campo **"Nombre de usuario"**
+(opcional) — es lo que se muestra en pujas y publicaciones **en vez del
+nombre de la cuenta de Google**, así nadie queda identificado por su
+nombre real si no quiere. Se usa en `sellerName` (al publicar o
+republicar) y en `currentBidderName`/`bids.userName` (al pujar) — ver
+`getPublicName` en `src/lib/users.js`, que devuelve el nombre de usuario
+si existe, si no el de Google.
+
+- **3 a 30 caracteres, solo letras, números y guión bajo** — mismo
+  criterio de siempre en el sitio de no dejar texto libre sin validar.
+- **Único**: no puede haber dos cuentas con el mismo (sin distinguir
+  mayúsculas de minúsculas — "Juan" y "juan" son el mismo nombre a
+  efectos de unicidad). Se resuelve con una colección aparte,
+  `usernames/{nombre en minúsculas}` → `{ uid }`: el propio id del
+  documento es lo que impide que dos cuentas reserven el mismo nombre,
+  ya que Firestore no deja crear dos veces el mismo id. Al cambiar de
+  nombre, se borra la reserva vieja y se crea la nueva en una sola
+  transacción junto con el cambio en `users/{uid}` (`updateUsername`).
+- **Cambiarlo tiene un enfriamiento de 1 semana** desde el último cambio
+  (`usernameChangedAt`) — la primera vez que se elige uno no hay espera.
+  Reforzado en `firestore.rules`, no solo en el código: la regla exige
+  que `usernameChangedAt` sea el momento real del servidor (no un valor
+  inventado por el cliente para simular que pasó más tiempo) y que hayan
+  pasado los 7 días, así no se puede saltear el enfriamiento escribiendo
+  directo a Firestore.
+
+## 26.3. Botón "volver arriba"
+
+Botón flotante (`src/components/ScrollToTopButton.jsx`), esquina inferior
+derecha, en todas las páginas (montado una sola vez en `App.jsx`). Aparece
+recién después de bajar más de 400px de scroll (con una transición de
+fade/desplazamiento) y al hacer click sube suavemente al principio de la
+página (`window.scrollTo({ top: 0, behavior: 'smooth' })`). No tiene lógica
+de servidor ni estado guardado — es puramente de interfaz.
+
+## 26.4. Republicar la última tanda, y limpieza automática de subastas viejas
+
+En `/perfil → Mis subastas`, si la tanda más reciente que publicaste tiene
+2 o más subastas cerradas sin pujas, aparece un botón **"Republicar tanda
+del [fecha] (N)"** que las reactiva de a una (ver `republishAuction`,
+sección 23.1). Se agrupan por fecha de publicación (huso horario
+Argentina) y **solo se ofrece la tanda más reciente** — no todo el
+historial — para no mezclar la carga de hoy con subastas de hace meses.
+
+Aparte, una Cloud Function (`cleanupOldAuctions`, corre una vez por día)
+**borra solas** las subastas cerradas **sin ninguna puja** (nunca se
+vendieron) que llevan más de 14 días así — junto con sus fotos en
+Storage. Cubre los tres estados que terminan sin venta, cada uno con su
+propio campo de fecha (no es el mismo en los tres):
+
+| Estado | Campo de fecha que mira |
+|---|---|
+| `ended` (venció sin que nadie puje) | `closedAt` |
+| `closed_by_admin` (la cerró Susurro/Araña) | `adminClosedAt` |
+| `cancelled_by_seller` (la canceló el vendedor) | `cancelledAt` |
+
+No tiene sentido guardarlas para siempre: no dejaron contacto revelado ni
+handshake que consultar, y si no se limpian se acumulan indefinidamente.
+Las que **sí** tuvieron un ganador (bidCount > 0, sin importar el estado)
+**no se tocan** — esas quedan para siempre por si hace falta revisar un
+reclamo más adelante (esas habría que borrarlas a mano si algún día
+hiciera falta).
+
+## 26.5. Workbench (impresiones 3D y productos a pedido)
+
+Sección aparte del resto del sitio (`/workbench`), pensada para que Susurro
+venda productos propios (impresiones 3D y otras piezas) y así ayudar a
+solventar los costos de TBMC — también sirve de "vidriera" llamativa para
+ofrecer el servicio.
+
+- **Catálogo**: a diferencia de Mercado, acá **solo Susurro** puede
+  publicar productos (`workbenchProducts`) — no es algo que arme cualquier
+  usuario. Cada producto tiene hasta 4 fotos, un video corto opcional,
+  título, precio y descripción. Susurro puede ocultar un producto sin
+  borrarlo (`active: false`).
+- **Pedido, no compra online**: a propósito **no hay pago ni webhooks**.
+  El botón dice **"Crear"** — al tocarlo cambia a **"Crafting…"** y aparece
+  un box para que quien pide escriba qué necesita (color, tamaño,
+  cantidad, fecha). Al enviarlo se crea un `workbenchOrders` con el
+  mensaje y el contacto de quien pidió (tomado de su perfil, igual que en
+  Mercado) — Susurro lo ve en `/admin` ("🔨 Pedidos del Workbench") y
+  coordina precio final y entrega por fuera, como en el resto del sitio.
+- El comprador puede seguir el estado de su pedido (pendiente / aceptado /
+  rechazado / entregado) en `/perfil → Workbench`.
+- Fotos/video en Storage (`workbench/{productId}/`) — a diferencia de
+  `auctions`/`market`, acá sí se pudo restringir bien la escritura al
+  dueño real (Susurro), porque no hace falta `firestore.get()` entre
+  servicios: es un simple chequeo de email.
+
+## 26.6. Mejoras inspiradas en casas de subastas de Japón
+
+Investigación de cómo se manejan Yahoo! Auctions y Hareruya (cadena
+especializada en Magic/Pokémon) en Japón, aplicada a esta etapa chica/en
+crecimiento del sitio:
+
+- **Fotos: 2 → 6** (`MAX_PHOTOS` en `src/lib/auctions.js` y duplicado en
+  `src/pages/CreateAuction.jsx`) — no era un diferenciador de plan (los 3
+  planes ya ofrecían "hasta 2 fotos" exactamente igual), así que subirlo
+  es ganancia pura de confianza sin tocar la monetización.
+- **Glosario de "Estado"**: en `/publicar`, un desplegable "ⓘ Qué
+  significa cada estado" con criterios concretos para Mint/Near
+  Mint/Excellent/Played/Damaged — inspirado en que Yahoo/Hareruya publican
+  tablas de criterios, no solo una etiqueta.
+- **"Sello de fábrica intacto"** (`sealIntact`): checkbox que aparece solo
+  con `itemType === 'sealed'` — la variable que más mueve el precio de un
+  sellado en el mercado japonés, antes no se capturaba.
+- **Graduación de terceros** (`isGraded`, `gradingCompany`, `grade`):
+  checkbox opcional para cartas individuales (PSA/BGS/CGC + nota), mismo
+  criterio que la cultura de "鑑定" (autenticación) que se ve en esos
+  sitios — se muestra como badge junto al título, igual que "Foil".
+- **Nueva franja de duración "7 días — objetos puntuales"** (`DURATION_TIERS`,
+  solo Intel de Pícaros): a diferencia de Japón, donde subastas de hasta 2
+  semanas son comunes porque hay volumen enorme de compradores orgánicos,
+  acá **no** se estiraron en bloque todas las franjas — las cortas se
+  habían acortado a propósito en su momento para evitar sniping y que el
+  sitio no se sienta "parado" (ver historial más abajo). Se sumó una única
+  franja larga, reservada al plan top, para piezas puntuales/raras que de
+  verdad necesitan más tiempo — la duración sigue siendo parte de lo que
+  se paga, no se regaló a Chusma.
+
+## 26.7. Cuentas de prueba sin email (limpieza en /admin)
+
+Cada ronda de testing (Playwright + `signInAnonymously`, usada varias
+veces en esta conversación para probar Mercado/Workbench/seguridad sin
+usar una cuenta real) crea una sesión anónima real — y `upsertUserProfile`
+le guarda igual un documento en `users/{uid}` (con `email: null`, porque
+una cuenta anónima no tiene), así que terminaban apareciendo en "Últimos
+registrados" y ensuciando los conteos (como el de pujadores distintos del
+sorteo bounty).
+
+En `/admin`, solo para Susurro, hay una sección **"🧪 Cuentas de prueba sin
+email"** (`findAnonymousTestUsers` en `src/lib/admin.js`) que las detecta
+— `email: null` es una firma confiable: un login real de Google siempre
+trae email — y las borra todas con un botón. Borra el documento de
+Firestore (dejan de aparecer en listados/conteos); la cuenta de
+autenticación anónima en sí queda huérfana en Firebase Auth, pero no
+aparece en ningún lado de la app ni afecta nada.
+
+## 26.8. Elegir otra duración al republicar
+
+`republishAuction` ya no está obligado a reusar la duración original de la
+subasta — acepta un `durationTierKey` opcional (si no se pasa, sigue
+reutilizando la de antes, comportamiento sin cambios). En `/perfil → Mis
+subastas`, al lado del botón "Republicar tanda del [fecha]", hay un
+selector **"Todas a: [duración]"** para aplicarle la misma duración nueva
+a las N subastas de esa tanda de una — pensado para el caso de republicar
+varias cartas viejas (24h originalmente) queriendo dejarlas, por ejemplo,
+7 días esta vez. Sigue sujeto al plan del vendedor, igual que publicar de
+cero (la de 7 días es solo para Intel de Pícaros). El botón individual
+"Republicar" por fila sigue reutilizando la duración original, sin
+selector — no se agregó ahí para no ensuciar cada renglón.
+
+## 26.9. "El Tablón de TBMC" — avisos por Telegram y Discord
+
+Dos comunidades externas, avisadas por la misma Cloud Function cada vez
+que se publica una carta nueva:
+
+- **Telegram**: canal público, de solo lectura (nadie salvo el bot puede
+  escribir) — **@tablontbmc**. El bot que postea se llama **El Rumor**
+  (continuando la idea de Susurro → el rumor que corre la voz).
+- **Discord**: servidor "The Black Market Connections", con canal
+  **#anuncios** de solo lectura (mismo criterio — ahí no se mezclan los
+  avisos automáticos con la charla) y **#general-chat** para la
+  comunidad. A diferencia de Telegram, acá no hace falta ni bot ni token:
+  Discord tiene **Webhooks** por canal, una URL a la que se le manda un
+  POST con el mensaje, sin login ni permisos que gestionar.
+
+- **Cómo se dispara**: Cloud Function `notifyTelegramOnNewAuction`
+  (`functions/index.js` — el nombre quedó de cuando era solo Telegram,
+  ahora cubre los dos), escucha `auctions/{id}` y solo actúa en la
+  transición `pending_review` → `active` — o sea, recién cuando una
+  publicación nueva termina de pasar el chequeo de fotos (automático por
+  Cloud Vision, o aprobada a mano por Susurro/Araña si había quedado
+  marcada). A propósito **no** avisa cuando se "Republica" una subasta
+  vieja (`ended` → `active`) — si no, republicar una tanda de 14 mandaría
+  14 avisos seguidos a los dos canales, muy spam. Los dos envíos van en
+  paralelo (`Promise.allSettled`) — si uno falla (ej: Discord caído), el
+  otro se manda igual.
+- **Qué manda**: título, precio actual, y el link directo a
+  `/subasta/{id}` en `theblackmarketconnections.com` — mismo texto para
+  los dos canales.
+- **Credenciales en Secret Manager**, nunca en el código ni en git:
+  `TELEGRAM_BOT_TOKEN` y `DISCORD_WEBHOOK_URL` (cargados con
+  `firebase functions:secrets:set`).
+- **Alcance actual: solo Subastas.** Mercado y Workbench quedan afuera por
+  ahora — se suman más adelante si los canales funcionan bien así.
+- **Pendiente/a pulir**: por ahora es solo texto (sin la foto de
+  portada) — queda como posible mejora futura. También se podría armar un
+  mensaje-resumen distinto para republicaciones en tanda ("Se repusieron
+  14 cartas") en vez de ignorarlas del todo.
+
+## 26.10. Incidente: fotos rotas por la limpieza automática (13/10/2026)
+
+**Qué pasó:** antes de arreglar el bug de "Republicar duplica subastas"
+(sección 23.1), el republicar viejo creaba una subasta nueva (`addDoc`)
+copiando el array `images` tal cual — las URLs seguían apuntando a la
+carpeta de Storage de la subasta ORIGINAL, no a una propia. Esas
+originales quedaron como huérfanas sin pujas. El 5/10, `cleanupOldAuctions`
+las borró (correctamente, por su propia lógica) — pero al borrar la
+carpeta de Storage de la huérfana, se llevó puestas las fotos que una
+subasta más nueva (ya "reparada", activa) seguía usando. Resultado: **15
+subastas quedaron con fotos rotas (404) sin forma de recuperarlas** — los
+archivos ya no existen.
+
+**Arreglado con dos cambios:**
+
+1. **`cleanupOldAuctions` ahora revisa antes de borrar**: junta los
+   `images` de todas las subastas que NO se van a borrar en esa corrida,
+   y si alguna carpeta de Storage todavía está en uso por otra subasta
+   viva, salta el borrado de esos archivos (el documento huérfano igual
+   se borra, solo se protegen las fotos compartidas).
+2. **Nueva herramienta de reparación**: `replaceAuctionImages`
+   (`src/lib/auctions.js`) deja resubir fotos de una subasta propia en
+   cualquier momento — con el botón **"Reemplazar fotos"** en
+   `/perfil → Mis subastas`, junto a "Republicar". Solo funciona mientras
+   `bidCount` sigue en 0 (reforzado en `firestore.rules`, misma regla que
+   ya dejaba completar `images` tras publicar) — una vez que hay pujas,
+   nadie puede tocar las fotos, para que no se preste a un "cambiazo".
+   Esto también cerró un hueco de seguridad que ya existía (esa regla no
+   tenía el chequeo de `bidCount == 0` antes de este incidente).
+
+## 26.11. Borrado manual de subastas (solo Susurro)
+
+Las subastas con pujas se guardan para siempre a propósito (sección
+anterior) — pero eso significa que subastas de prueba con pujas falsas
+(de cuando se iba probando el sitio) nunca se iban a poder borrar. Se
+agregó una excepción deliberada: **Susurro puede borrar cualquier
+subasta**, tenga o no pujas, desde `/admin` (botón "Borrar" al lado de
+"Cerrar", en la lista de subastas de un vendedor) — `deleteAuctionByAdmin`
+en `src/lib/admin.js`, reforzado en `firestore.rules` con
+`|| isSusurro()`. Es una acción manual y puntual, no algo que la limpieza
+automática haga sola (eso seguiría rompiendo la protección contra "borrar
+evidencia" para casos reales).
+
+La limpieza de "🧪 Cuentas de prueba sin email" en `/admin` (sección
+26.7) también se extendió: ahora, al borrar una cuenta anónima de
+prueba, borra de paso cualquier subasta que haya publicado — esas no
+aparecían en el buscador normal (es por email, y las cuentas de prueba no
+tienen) y quedaban atascadas en "en revisión" para siempre.
 
 ## 27. Historial de decisiones
 
@@ -1008,3 +1391,54 @@ estar logueado para mandar el formulario.
   — probablemente por una edición externa al editor, no por nada hecho en
   una conversación anterior — lo que rompía el build. Se reconstruyó el
   archivo completo antes de seguir.
+- *Sorteo bounty*: se agregó un sorteo puntual de una carta concreta,
+  activado a mano desde `/admin`, con puntos extra por traer gente nueva
+  vía un link personal de invitación (sección 7.1). Decisión explícita al
+  diseñarlo: los puntos NO se acumulan para siempre — solo cuentan
+  mientras hay un sorteo activo, y cada sorteo nuevo arranca de cero
+  (subcolección `entries` aparte por sorteo), para que no siempre gane
+  ventaja la misma gente que invitó temprano una sola vez. Acreditar
+  puntos a otra persona (quien invitó) no se podía resolver con una
+  escritura común del cliente sin abrir la puerta a que alguien se
+  autoacreditara puntos — quedó resuelto con dos Cloud Functions nuevas
+  (`awardReferralSignupBonus`, `awardReferralBidBonus`).
+- *Filtro de juego con botones*: se reemplazó el dropdown de "Juego" en el
+  home por botones de un clic (sección 2, filtros) — mismo filtrado de
+  siempre, solo cambió la forma de elegirlo.
+- *Republicar subasta sin pujas*: se agregó un botón en "Mis subastas"
+  (sección 23.1) para volver a publicar una carta que cerró sin ninguna
+  puja, sin tener que cargar todo de nuevo. Reutiliza las fotos ya
+  subidas (siguen en Storage) en vez de volver a subirlas, así que la
+  nueva subasta arranca directo en `active`, sin pasar por revisión de
+  nuevo — esas fotos ya se habían chequeado la primera vez.
+- *Revisión de seguridad*: auditoría completa de reglas y Cloud Functions
+  (sección 26.1). Se encontró que la mayoría de la lógica de negocio
+  (límite diario, validación de pujas, moderación de fotos) solo vivía en
+  el código del sitio, no reforzada en `firestore.rules` — se corrigieron
+  los tres problemas serios (publicar ya "activa" saltándose la revisión,
+  marcar a otra persona como ganadora de una puja sin que haya pujado, y
+  poder borrar una subasta cerrada sin restricción). El intento de
+  arreglar también el problema de Storage (cualquiera puede subir a la
+  carpeta de cualquier subasta) se revirtió porque el permiso cruzado
+  Storage↔Firestore necesario no se activó en este entorno y rompía las
+  subidas legítimas — queda pendiente. La autenticación anónima (activada
+  este mismo chat para poder probar) sigue encendida en producción y
+  también queda pendiente de desactivar — mientras esté prendida, resta
+  sentido a los bans, al límite diario, y a la integridad del sorteo
+  bounty.
+- *Republicar ya no duplica*: se cambió `republishAuction` de crear una
+  subasta nueva a reactivar el mismo documento (sección 23.1), porque
+  antes aparecía duplicada en "Mis subastas" (la cerrada y la nueva
+  activa, como dos ítems distintos). De paso se simplificó la regla de
+  Firestore correspondiente (ya no necesita el `get()` cruzado contra
+  otra subasta que tenía antes).
+- *Nombre de usuario*: se agregó en `/perfil` (sección 26.2), único
+  (reservado en una colección aparte), con enfriamiento de 1 semana para
+  cambiarlo — reforzado en `firestore.rules`, no solo en el código.
+  Reemplaza al nombre de Google como lo que se ve en pujas y
+  publicaciones (`getPublicName`). Al implementarlo apareció un bug real:
+  la función usaba `update()` (que exige que el documento ya exista) en
+  vez de `set(..., {merge:true})` — si alguien elegía su nombre de
+  usuario antes de que `upsertUserProfile` (que es async) terminara de
+  crear su perfil por primera vez, la escritura fallaba con "no existe".
+  Corregido antes de publicar.

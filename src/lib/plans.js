@@ -18,7 +18,7 @@ export const PLANS = {
     features: [
       '2 publicaciones por día',
       'Pujas ilimitadas',
-      'Hasta 2 fotos por carta',
+      'Hasta 6 fotos por carta',
       'Anti-sniping y contacto post-cierre incluidos',
       'Orden normal en el home (sin prioridad)',
     ],
@@ -34,7 +34,7 @@ export const PLANS = {
     features: [
       '10 publicaciones por día',
       'Pujas ilimitadas',
-      'Hasta 2 fotos por carta',
+      'Hasta 6 fotos por carta',
       'Anti-sniping y contacto post-cierre incluidos',
       '✦ Aparecés "Destacado" y más arriba en el home',
       '✦ Todas las duraciones, incluida la de 12 horas',
@@ -51,10 +51,10 @@ export const PLANS = {
     features: [
       'Publicaciones ilimitadas por día',
       'Pujas ilimitadas',
-      'Hasta 2 fotos por carta',
+      'Hasta 6 fotos por carta',
       'Anti-sniping y contacto post-cierre incluidos',
       '★ Prioridad máxima — arriba de todo el home',
-      '★ Todas las duraciones, incluida la de 24 horas',
+      '★ Todas las duraciones, incluida la de 7 días para objetos puntuales',
     ],
   },
 }

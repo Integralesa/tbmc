@@ -13,7 +13,7 @@ import { useCardShopLabels } from '../lib/cardShops'
 
 const MAGIC_GAME = 'Magic: The Gathering'
 
-const MAX_PHOTOS = 2
+const MAX_PHOTOS = 6
 const MAX_RAW_FILE_MB = 25 // freno de emergencia antes de comprimir; casos normales de celular entran de sobra
 const MAX_PRICE_DIGITS = 18 // tope contra números absurdos (ej: alguien fat-fingereando ceros de más)
 
@@ -36,13 +36,18 @@ export default function CreateAuction() {
   const [titleIsValidCard, setTitleIsValidCard] = useState(false)
   const [game, setGame] = useState('Pokémon')
   const [isFoil, setIsFoil] = useState(false)
-  const [itemType, setItemType] = useState('card') // 'card' | 'singles' | 'lote' | 'sleeves' | 'deckbox' | 'set_cartas' | 'board_game'
+  const [itemType, setItemType] = useState('card') // 'card' | 'singles' | 'lote' | 'sleeves' | 'deckbox' | 'set_cartas' | 'board_game' | 'sealed'
   const [loteQuantity, setLoteQuantity] = useState('')
   const [loteSetsVariados, setLoteSetsVariados] = useState(false)
   const [loteSets, setLoteSets] = useState([]) // [{code, name}]
   const [magicSets, setMagicSets] = useState([])
   const [setToAdd, setSetToAdd] = useState('')
   const [condition, setCondition] = useState('Near Mint')
+  const [showConditionGlossary, setShowConditionGlossary] = useState(false)
+  const [sealIntact, setSealIntact] = useState(false)
+  const [isGraded, setIsGraded] = useState(false)
+  const [gradingCompany, setGradingCompany] = useState('PSA')
+  const [grade, setGrade] = useState('')
   const [startingPrice, setStartingPrice] = useState('')
   const [durationTierKey, setDurationTierKey] = useState('30min')
   const [deliveryMethods, setDeliveryMethods] = useState([])
@@ -109,9 +114,9 @@ export default function CreateAuction() {
   // "Singles" es solo una etiqueta — se sigue exigiendo elegir la carta de
   // la lista de sugerencias, igual que el default (sin ningún checkbox
   // tildado). Tildar Lote / Sleeves / Deckbox / Set de Cartas / Juego de
-  // mesa, en cambio, saca del medio esa búsqueda obligatoria — el título
-  // pasa a armarse solo (ver más abajo). Tildar de nuevo el mismo vuelve a
-  // "carta individual".
+  // mesa / Material Sellado, en cambio, saca del medio esa búsqueda
+  // obligatoria — el título pasa a armarse solo (ver más abajo). Tildar de
+  // nuevo el mismo vuelve a "carta individual".
   function handleItemTypeToggle(type) {
     const next = itemType === type ? 'card' : type
     setItemType(next)
@@ -146,6 +151,11 @@ export default function CreateAuction() {
     }
     if (itemType === 'board_game') {
       setTitle('BoardGame')
+      setTitleIsValidCard(true)
+      return
+    }
+    if (itemType === 'sealed') {
+      setTitle('Material Sellado')
       setTitleIsValidCard(true)
       return
     }
@@ -275,6 +285,10 @@ export default function CreateAuction() {
         loteQuantity: itemType === 'lote' ? loteQuantity : null,
         loteSets: itemType === 'lote' ? loteSets : [],
         loteSetsVariados: itemType === 'lote' ? loteSetsVariados : false,
+        sealIntact: itemType === 'sealed' ? sealIntact : null,
+        isGraded: (itemType === 'card' || itemType === 'singles') && isGraded,
+        gradingCompany: (itemType === 'card' || itemType === 'singles') && isGraded ? gradingCompany : null,
+        grade: (itemType === 'card' || itemType === 'singles') && isGraded && grade ? Number(grade) : null,
         startingPrice,
         durationTierKey,
         deliveryMethods,
@@ -521,6 +535,15 @@ export default function CreateAuction() {
               />
               Juego de mesa
             </label>
+            <label className="flex items-center gap-2 text-sm text-parchment/85 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={itemType === 'sealed'}
+                onChange={() => handleItemTypeToggle('sealed')}
+                className="accent-brass w-4 h-4"
+              />
+              Material Sellado
+            </label>
           </div>
           <p className="text-[11px] text-muted mt-2">
             "Singles" es solo para marcar que es una carta suelta (sigue habiendo que elegirla de la lista de
@@ -648,7 +671,25 @@ export default function CreateAuction() {
         </div>
 
         <div>
-          <label className="block text-sm text-muted mb-1.5">Estado</label>
+          <div className="flex items-center justify-between mb-1.5">
+            <label className="block text-sm text-muted">Estado</label>
+            <button
+              type="button"
+              onClick={() => setShowConditionGlossary((v) => !v)}
+              className="text-[11px] text-brass hover:underline"
+            >
+              {showConditionGlossary ? 'Ocultar' : 'ⓘ Qué significa cada estado'}
+            </button>
+          </div>
+          {showConditionGlossary && (
+            <ul className="text-[11px] text-muted mb-2 space-y-1 border border-panelLine bg-panel px-3 py-2">
+              <li><span className="text-parchment">Mint:</span> perfecta, como salida de sobre, sin ninguna marca.</li>
+              <li><span className="text-parchment">Near Mint:</span> sin marcas visibles a simple vista — como mucho, desgaste mínimo en esquinas bajo luz directa.</li>
+              <li><span className="text-parchment">Excellent:</span> algo de desgaste leve (esquinas, bordes o superficie), pero se nota solo mirando de cerca.</li>
+              <li><span className="text-parchment">Played:</span> desgaste visible a simple vista — marcas, doblado leve o rayones.</li>
+              <li><span className="text-parchment">Damaged:</span> daño importante — roturas, dobleces fuertes, manchas, escritura, etc.</li>
+            </ul>
+          )}
           <select
             value={condition}
             onChange={(e) => setCondition(e.target.value)}
@@ -661,6 +702,56 @@ export default function CreateAuction() {
             <option>Damaged</option>
           </select>
         </div>
+
+        {(itemType === 'card' || itemType === 'singles') && (
+          <div className="border border-panelLine bg-panel p-4">
+            <label className="flex items-center gap-2.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={isGraded}
+                onChange={(e) => setIsGraded(e.target.checked)}
+                className="accent-brass w-4 h-4"
+              />
+              <span className="text-sm text-parchment/85">Está graduada (PSA / BGS / CGC)</span>
+            </label>
+            {isGraded && (
+              <div className="flex gap-3 mt-3">
+                <select
+                  value={gradingCompany}
+                  onChange={(e) => setGradingCompany(e.target.value)}
+                  className="flex-1 bg-ink border border-panelLine px-3 py-2 text-sm text-parchment focus:border-brass outline-none"
+                >
+                  <option>PSA</option>
+                  <option>BGS</option>
+                  <option>CGC</option>
+                  <option>Otra</option>
+                </select>
+                <input
+                  type="number"
+                  min="1"
+                  max="10"
+                  step="0.5"
+                  value={grade}
+                  onChange={(e) => setGrade(e.target.value)}
+                  placeholder="Grado (ej: 10)"
+                  className="w-32 bg-ink border border-panelLine px-3 py-2 text-sm text-parchment placeholder:text-muted/60 focus:border-brass outline-none"
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {itemType === 'sealed' && (
+          <label className="flex items-center gap-2.5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={sealIntact}
+              onChange={(e) => setSealIntact(e.target.checked)}
+              className="accent-brass w-4 h-4"
+            />
+            <span className="text-sm text-parchment/85">Sello de fábrica intacto (shrink-wrap)</span>
+          </label>
+        )}
 
         <label className="flex items-center gap-2.5 cursor-pointer">
           <input
@@ -736,7 +827,7 @@ export default function CreateAuction() {
             </p>
             {plan.priority < 2 && (
               <p className="text-[11px] text-muted mt-1">
-                Las duraciones de 12h y 24h se desbloquean con planes superiores —{' '}
+                Las duraciones de 12h, 24h y 7 días se desbloquean con planes superiores —{' '}
                 <Link to="/planes" className="text-brass hover:underline">
                   ver planes
                 </Link>
@@ -782,7 +873,7 @@ export default function CreateAuction() {
             Subilas de a una — si te equivocás, sacala con la ✕ y subí otra.
           </p>
           {previews.length > 0 && (
-            <div className="flex gap-3 mb-3">
+            <div className="flex flex-wrap gap-3 mb-3">
               {previews.map((src, i) => (
                 <div key={i} className="flex flex-col items-center gap-1.5">
                   <div className="relative">

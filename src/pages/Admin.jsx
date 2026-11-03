@@ -5,6 +5,7 @@ import {
   approvePlanRequest,
   banUser,
   closeAuctionByAdmin,
+  deleteAuctionByAdmin,
   findAuctionsBySeller,
   findUserByEmail,
   rejectPlanRequest,
@@ -12,6 +13,8 @@ import {
   setUserRole,
   unbanUser,
   addStrike,
+  deleteUserDoc,
+  findAnonymousTestUsers,
 } from '../lib/admin'
 import { isArana, isStaff, isSusurro } from '../lib/roles'
 import { subscribeToPendingPlanRequests } from '../lib/planRequests'
@@ -22,6 +25,14 @@ import { markPhotoFlagReviewed, subscribeToOpenPhotoFlags } from '../lib/photoFl
 import { approveShopSuggestion, rejectShopSuggestion, subscribeToOpenShopSuggestions } from '../lib/cardShops'
 import { getRecentUsers, isUserBanned } from '../lib/users'
 import { PLANS } from '../lib/plans'
+import {
+  activateBountyRaffle,
+  createBountyDraft,
+  drawBountyWinner,
+  getDistinctBidderCount,
+  subscribeToAllBountyRaffles,
+} from '../lib/bountyRaffles'
+import { setOrderStatus, subscribeToAllOrders } from '../lib/workbench'
 
 export default function Admin() {
   const { user, profile } = useAuth()
@@ -57,6 +68,20 @@ export default function Admin() {
 
   const [recentUsers, setRecentUsers] = useState(null)
   const [loadingRecentUsers, setLoadingRecentUsers] = useState(false)
+
+  const [testUsers, setTestUsers] = useState(null)
+  const [loadingTestUsers, setLoadingTestUsers] = useState(false)
+  const [deletingTestUsers, setDeletingTestUsers] = useState(false)
+
+  const [workbenchOrders, setWorkbenchOrders] = useState(null)
+  const [resolvingOrderId, setResolvingOrderId] = useState(null)
+
+  const [bountyRaffles, setBountyRaffles] = useState(null)
+  const [bountyTitle, setBountyTitle] = useState('')
+  const [bountyImage, setBountyImage] = useState(null)
+  const [creatingBounty, setCreatingBounty] = useState(false)
+  const [bountyActionId, setBountyActionId] = useState(null)
+  const [distinctBidders, setDistinctBidders] = useState(null)
 
   const susurro = isSusurro(user)
   const staff = isStaff(user, profile)
@@ -119,6 +144,119 @@ export default function Admin() {
     loadRecentUsers()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [staff])
+
+  async function loadTestUsers() {
+    setLoadingTestUsers(true)
+    try {
+      setTestUsers(await findAnonymousTestUsers())
+    } catch (err) {
+      setError(err.message || 'No se pudieron cargar las cuentas de prueba.')
+    } finally {
+      setLoadingTestUsers(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!susurro) return
+    loadTestUsers()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [susurro])
+
+  // Borra de a una (no en paralelo) para no pegarle 100 escrituras juntas
+  // a Firestore si alguna vez se junta un lote grande de testing. También
+  // borra cualquier subasta que haya quedado publicada por esas cuentas
+  // (ej: pruebas de Playwright que publicaron algo y quedó atascado en
+  // "en revisión" para siempre) — esas no aparecen en el buscador normal
+  // porque es por email, y las cuentas de prueba no tienen.
+  async function handleDeleteTestUsers() {
+    if (!testUsers || testUsers.length === 0) return
+    if (!window.confirm(`¿Borrar ${testUsers.length} cuenta(s) de prueba sin email (y sus subastas, si publicaron algo)?`)) return
+    setDeletingTestUsers(true)
+    setError('')
+    setMessage('')
+    let deletedAuctions = 0
+    try {
+      for (const u of testUsers) {
+        const theirAuctions = await findAuctionsBySeller(u.id)
+        for (const a of theirAuctions) {
+          await deleteAuctionByAdmin(a.id)
+          deletedAuctions++
+        }
+        await deleteUserDoc(u.id)
+      }
+      setMessage(`Borradas ${testUsers.length} cuenta(s) de prueba${deletedAuctions > 0 ? ` y ${deletedAuctions} subasta(s) suya(s)` : ''}.`)
+      setTestUsers([])
+    } catch (err) {
+      setError(err.message || 'No se pudieron borrar todas — probá de nuevo.')
+      loadTestUsers()
+    } finally {
+      setDeletingTestUsers(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!susurro) return
+    const unsub = subscribeToAllOrders(setWorkbenchOrders)
+    return unsub
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [susurro])
+
+  useEffect(() => {
+    if (!susurro) return
+    const unsub = subscribeToAllBountyRaffles(setBountyRaffles)
+    return unsub
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [susurro])
+
+  useEffect(() => {
+    if (!susurro) return
+    getDistinctBidderCount().then(setDistinctBidders).catch(() => {})
+  }, [susurro])
+
+  async function handleCreateBounty(e) {
+    e.preventDefault()
+    setError('')
+    setMessage('')
+    setCreatingBounty(true)
+    try {
+      await createBountyDraft({ title: bountyTitle, imageFile: bountyImage, user })
+      setBountyTitle('')
+      setBountyImage(null)
+      setMessage('Sorteo creado en borrador — todavía no aparece en el home.')
+    } catch (err) {
+      setError(err.message || 'No se pudo crear el sorteo.')
+    } finally {
+      setCreatingBounty(false)
+    }
+  }
+
+  async function handleActivateBounty(raffleId) {
+    setBountyActionId(raffleId)
+    setError('')
+    setMessage('')
+    try {
+      await activateBountyRaffle(raffleId)
+      setMessage('Sorteo activado — ya aparece en el home.')
+    } catch (err) {
+      setError(err.message || 'No se pudo activar el sorteo.')
+    } finally {
+      setBountyActionId(null)
+    }
+  }
+
+  async function handleDrawBounty(raffleId) {
+    setBountyActionId(raffleId)
+    setError('')
+    setMessage('')
+    try {
+      const winner = await drawBountyWinner(raffleId)
+      setMessage(`Ganó ${winner.name}.`)
+    } catch (err) {
+      setError(err.message || 'No se pudo sortear el ganador.')
+    } finally {
+      setBountyActionId(null)
+    }
+  }
 
   if (!user) {
     return (
@@ -246,7 +384,7 @@ export default function Admin() {
     }
   }
 
-  async function handleStrike(reportId, uid, roleLabel) {
+  async function handleStrike(reportId, uid, roleLabel, role) {
     if (!uid) {
       setError('No tengo el ID de esa persona (subasta muy vieja). Buscala a mano por email.')
       return
@@ -255,13 +393,25 @@ export default function Admin() {
     setError('')
     setMessage('')
     try {
-      const total = await addStrike(uid)
+      const total = await addStrike(uid, role)
       await markProblemReportReviewed(reportId)
       setMessage(`Incumplimiento sumado a ${roleLabel} (van ${total}).`)
     } catch (err) {
       setError(err.message || 'No se pudo sumar el incumplimiento.')
     } finally {
       setResolvingReportId(null)
+    }
+  }
+
+  async function handleSetOrderStatus(orderId, status) {
+    setResolvingOrderId(orderId)
+    setError('')
+    try {
+      await setOrderStatus(orderId, status)
+    } catch (err) {
+      setError(err.message || 'No se pudo actualizar el pedido.')
+    } finally {
+      setResolvingOrderId(null)
     }
   }
 
@@ -395,6 +545,22 @@ export default function Admin() {
     }
   }
 
+  async function handleDeleteAuction(auctionId, title) {
+    if (!window.confirm(`¿Borrar "${title}" definitivamente? No se puede deshacer.`)) return
+    setActing(true)
+    setError('')
+    setMessage('')
+    try {
+      await deleteAuctionByAdmin(auctionId)
+      setSellerAuctions((list) => list.filter((a) => a.id !== auctionId))
+      setMessage('Subasta borrada.')
+    } catch (err) {
+      setError(err.message || 'No se pudo borrar la subasta.')
+    } finally {
+      setActing(false)
+    }
+  }
+
   const currentPlan = PLANS[result?.plan] || PLANS.free
 
   // Reglas de a quién se puede suspender: nadie se suspende a sí mismo;
@@ -475,6 +641,7 @@ export default function Admin() {
               const otherRoleIsSeller = r.reportedRole === 'winner' // si reportó el ganador, el problema es con el vendedor
               const targetUid = otherRoleIsSeller ? r.sellerId : r.winnerId
               const targetLabel = otherRoleIsSeller ? 'vendedor' : 'comprador'
+              const targetRole = otherRoleIsSeller ? 'seller' : 'bidder'
               return (
                 <li key={r.id} className="border border-panelLine p-3">
                   <a
@@ -490,7 +657,7 @@ export default function Admin() {
                   <p className="text-parchment/85 text-sm mt-2 italic">"{r.reason}"</p>
                   <div className="flex flex-wrap gap-2 mt-3">
                     <button
-                      onClick={() => handleStrike(r.id, targetUid, targetLabel)}
+                      onClick={() => handleStrike(r.id, targetUid, targetLabel, targetRole)}
                       disabled={resolvingReportId === r.id}
                       className="px-3 py-1.5 bg-bidRed text-ink text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
                     >
@@ -667,6 +834,161 @@ export default function Admin() {
               )
             })}
           </ul>
+        </div>
+      )}
+
+      {susurro && workbenchOrders && workbenchOrders.filter((o) => o.status === 'pending').length > 0 && (
+        <div className="border border-brass bg-panel p-4 mb-8">
+          <p className="text-xs uppercase tracking-wide text-brass mb-3">
+            🔨 Pedidos del Workbench ({workbenchOrders.filter((o) => o.status === 'pending').length})
+          </p>
+          <ul className="space-y-4">
+            {workbenchOrders.filter((o) => o.status === 'pending').map((o) => (
+              <li key={o.id} className="border border-panelLine p-3">
+                <a href={`/workbench/${o.productId}`} className="text-brass text-sm hover:underline">
+                  {o.productTitle}
+                </a>
+                <p className="text-muted text-xs mt-1">
+                  {o.buyerName} — {o.buyerEmail}
+                  {o.buyerPhone && ` — WhatsApp: ${o.buyerPhone}`}
+                </p>
+                <p className="text-parchment/85 text-sm mt-2 italic">"{o.message}"</p>
+                <div className="flex flex-wrap gap-2 mt-3">
+                  <button
+                    onClick={() => handleSetOrderStatus(o.id, 'accepted')}
+                    disabled={resolvingOrderId === o.id}
+                    className="px-3 py-1.5 bg-brass text-ink text-xs font-medium hover:bg-brassHigh transition-colors disabled:opacity-50"
+                  >
+                    Aceptar
+                  </button>
+                  <button
+                    onClick={() => handleSetOrderStatus(o.id, 'rejected')}
+                    disabled={resolvingOrderId === o.id}
+                    className="px-3 py-1.5 border border-bidRed text-bidRed text-xs font-medium hover:bg-bidRed/10 transition-colors disabled:opacity-50"
+                  >
+                    Rechazar
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {susurro && (
+        <div className="border-2 border-brass bg-panel p-4 mb-8">
+          <p className="text-xs uppercase tracking-wide text-brass mb-3">💰 Sorteo bounty</p>
+
+          <p className="text-[11px] text-muted mb-4">
+            {distinctBidders === null
+              ? 'Calculando cuánta gente pujó alguna vez…'
+              : `${distinctBidders} persona${distinctBidders === 1 ? '' : 's'} pujaron alguna vez en el sitio (referencia — no bloquea activar el sorteo).`}
+          </p>
+
+          <form onSubmit={handleCreateBounty} className="space-y-2 mb-5 pb-5 border-b border-panelLine">
+            <p className="text-[11px] text-muted mb-1">Nuevo sorteo (arranca en borrador, invisible)</p>
+            <input
+              type="text"
+              value={bountyTitle}
+              onChange={(e) => setBountyTitle(e.target.value)}
+              placeholder="Nombre de la carta"
+              className="w-full bg-ink border border-panelLine px-3 py-2 text-sm text-parchment placeholder:text-muted/60 focus:border-brass outline-none"
+            />
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => setBountyImage(e.target.files?.[0] || null)}
+              className="w-full text-xs text-muted file:mr-3 file:py-1.5 file:px-3 file:border file:border-panelLine file:bg-ink file:text-parchment file:cursor-pointer"
+            />
+            <button
+              type="submit"
+              disabled={creatingBounty}
+              className="px-4 py-2 bg-brass text-ink text-xs font-medium hover:bg-brassHigh transition-colors disabled:opacity-50"
+            >
+              {creatingBounty ? 'Creando…' : 'Crear en borrador'}
+            </button>
+          </form>
+
+          {bountyRaffles === null ? (
+            <p className="text-muted text-sm">Cargando…</p>
+          ) : bountyRaffles.length === 0 ? (
+            <p className="text-muted text-sm">Todavía no se creó ningún sorteo bounty.</p>
+          ) : (
+            <ul className="space-y-3">
+              {bountyRaffles.map((r) => (
+                <li key={r.id} className="border border-panelLine p-3 flex gap-3">
+                  {r.imageUrl && (
+                    <img src={r.imageUrl} alt="" className="w-14 h-18 object-cover border border-panelLine shrink-0" />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <p className="text-parchment text-sm">{r.title}</p>
+                    <p className="text-[11px] text-muted mb-2">
+                      {r.status === 'draft' && 'Borrador — no visible'}
+                      {r.status === 'active' && 'Activo — visible en el home'}
+                      {r.status === 'closed' && `Cerrado — ganó ${r.winnerName || '—'} (${r.totalEntries || 0} entradas)`}
+                    </p>
+                    <div className="flex gap-2">
+                      {r.status === 'draft' && (
+                        <button
+                          onClick={() => handleActivateBounty(r.id)}
+                          disabled={bountyActionId === r.id}
+                          className="px-3 py-1.5 bg-brass text-ink text-xs font-medium hover:bg-brassHigh transition-colors disabled:opacity-50"
+                        >
+                          Activar
+                        </button>
+                      )}
+                      {r.status === 'active' && (
+                        <button
+                          onClick={() => handleDrawBounty(r.id)}
+                          disabled={bountyActionId === r.id}
+                          className="px-3 py-1.5 bg-bidRed text-ink text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+                        >
+                          {bountyActionId === r.id ? 'Sorteando…' : 'Sortear ganador'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {susurro && (
+        <div className="border border-panelLine bg-panel p-4 mb-8">
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-xs uppercase tracking-wide text-brass">
+              🧪 Cuentas de prueba sin email {testUsers ? `(${testUsers.length})` : ''}
+            </p>
+            <button
+              onClick={loadTestUsers}
+              disabled={loadingTestUsers}
+              className="text-xs text-muted hover:text-parchment transition-colors disabled:opacity-50"
+            >
+              {loadingTestUsers ? 'Actualizando…' : 'Actualizar'}
+            </button>
+          </div>
+          <p className="text-[11px] text-muted mb-3">
+            Sesiones anónimas (de testing, sin Google real detrás) — nunca tienen email cargado, así se
+            las identifica. Borrar acá solo saca el perfil de Firestore (deja de aparecer en listados y
+            conteos); no afecta ninguna cuenta real.
+          </p>
+          {testUsers === null ? (
+            <p className="text-muted text-sm">Cargando…</p>
+          ) : testUsers.length === 0 ? (
+            <p className="text-muted text-sm">No hay ninguna ahora mismo.</p>
+          ) : (
+            <>
+              <button
+                onClick={handleDeleteTestUsers}
+                disabled={deletingTestUsers}
+                className="px-3 py-1.5 bg-bidRed text-ink text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-50 mb-2"
+              >
+                {deletingTestUsers ? 'Borrando…' : `Borrar las ${testUsers.length}`}
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -895,14 +1217,26 @@ export default function Admin() {
                           <p className="text-[11px] text-bidRed">Motivo: {a.adminCloseReason}</p>
                         )}
                       </div>
-                      {a.status === 'active' && closingId !== a.id && (
-                        <button
-                          onClick={() => setClosingId(a.id)}
-                          className="shrink-0 px-3 py-1.5 border border-bidRed text-bidRed text-xs font-medium hover:bg-bidRed/10 transition-colors"
-                        >
-                          Cerrar
-                        </button>
-                      )}
+                      <div className="flex gap-2 shrink-0">
+                        {a.status === 'active' && closingId !== a.id && (
+                          <button
+                            onClick={() => setClosingId(a.id)}
+                            className="px-3 py-1.5 border border-bidRed text-bidRed text-xs font-medium hover:bg-bidRed/10 transition-colors"
+                          >
+                            Cerrar
+                          </button>
+                        )}
+                        {susurro && (
+                          <button
+                            onClick={() => handleDeleteAuction(a.id, a.title)}
+                            disabled={acting}
+                            className="px-3 py-1.5 bg-bidRed text-ink text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+                            title="Borra la subasta aunque tenga pujas — solo Susurro"
+                          >
+                            Borrar
+                          </button>
+                        )}
+                      </div>
                     </div>
 
                     {closingId === a.id && (

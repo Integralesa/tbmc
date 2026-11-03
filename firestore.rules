@@ -29,23 +29,58 @@ service cloud.firestore {
 
     match /auctions/{auctionId} {
       allow read: if true;
+
+      // Toda publicación nueva arranca "limpia": sin pujas, con el precio
+      // actual igual al inicial, en 'pending_review' y sin ninguna foto
+      // todavía chequeada (Cloud Vision decide cuándo pasa a 'active', ver
+      // checkAuctionPhoto). Antes esto solo pedía que sellerId fuera el
+      // propio uid — cualquiera podía publicar ya 'active', con cualquier
+      // precio/duración/fotos, saltándose el límite diario, el chequeo de
+      // fotos y el plan requerido para cada duración (esos controles solo
+      // estaban en el código del sitio, nunca reforzados acá). "Republicar"
+      // (ver más abajo) NO pasa por acá — reactiva el mismo documento, no
+      // crea uno nuevo.
       allow create: if request.auth != null
-                    && request.resource.data.sellerId == request.auth.uid;
+                    && request.resource.data.sellerId == request.auth.uid
+                    && request.resource.data.bidCount == 0
+                    && request.resource.data.currentBidderId == null
+                    && request.resource.data.currentPrice == request.resource.data.startingPrice
+                    && request.resource.data.status == 'pending_review'
+                    && request.resource.data.photosChecked == 0
+                    && request.resource.data.hasFlaggedPhoto == false;
+
       // Solo permitimos que se actualice vía la transacción de puja
       // (currentPrice, currentBidderId, currentBidderName, bidCount, endsAt
       // por la extensión anti-sniping, bidderStreak/lastBidAt por el límite
-      // de pujas seguidas), que el propio vendedor complete el campo images
-      // tras subir las fotos, que Susurro/Araña cierren la subasta a mano, o
-      // que el propio vendedor la edite/cancele dentro de la ventana de
-      // arrepentimiento (ver withinSellerEditWindow) — sin poder tocar
-      // precio ni fotos en la edición, para que no pueda hacer un "cambiazo".
+      // de pujas seguidas — y ahora, a diferencia de antes, se exige que
+      // quien puja se esté marcando a SÍ MISMO como nuevo puntero
+      // [currentBidderId == su propio uid — antes cualquiera podía marcar a
+      // OTRA persona como si estuviera ganando, y esa persona terminaba
+      // recibiendo un contacto revelado sin haber pujado nunca], que el
+      // precio solo pueda subir, y que bidCount suba de a uno), que el
+      // propio vendedor complete el campo images tras subir las fotos, que
+      // Susurro/Araña cierren la subasta a mano, o que el propio vendedor
+      // la edite/cancele dentro de la ventana de arrepentimiento (ver
+      // withinSellerEditWindow) — sin poder tocar precio ni fotos en la
+      // edición, para que no pueda hacer un "cambiazo".
       allow update: if request.auth != null && (
         (request.resource.data.diff(resource.data).affectedKeys()
           .hasOnly(['currentPrice', 'currentBidderId', 'currentBidderName', 'currentBidderWantsNotify', 'bidCount', 'endsAt', 'bidderStreak', 'lastBidAt'])
-          && request.resource.data.sellerId != request.auth.uid)
+          && request.resource.data.sellerId != request.auth.uid
+          && resource.data.status == 'active'
+          && request.resource.data.currentBidderId == request.auth.uid
+          && request.resource.data.currentPrice > resource.data.currentPrice
+          && request.resource.data.bidCount == (resource.data.bidCount == null ? 0 : resource.data.bidCount) + 1)
         ||
+        // Completar "images" justo después de publicar (createAuction sube
+        // las fotos después de crear el documento) — o reemplazarlas más
+        // adelante con replaceAuctionImages si se rompió algo (ver
+        // COMO-FUNCIONA.md, incidente de fotos huérfanas). Solo mientras
+        // bidCount sigue en 0: ya con una puja encima, nadie puede
+        // cambiarle las fotos a una subasta (sería un "cambiazo").
         (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['images'])
-          && resource.data.sellerId == request.auth.uid)
+          && resource.data.sellerId == request.auth.uid
+          && (resource.data.bidCount == null || resource.data.bidCount == 0))
         ||
         (isStaff()
           && request.resource.data.diff(resource.data).affectedKeys()
@@ -60,8 +95,36 @@ service cloud.firestore {
           && withinSellerEditWindow(resource.data)
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledAt'])
           && request.resource.data.status == 'cancelled_by_seller')
+        ||
+        // Republicar (ver republishAuction en src/lib/auctions.js): reactiva
+        // una subasta propia ya cerrada y sin ninguna puja, sin crear un
+        // documento nuevo (así no aparece duplicada en "Mis subastas").
+        // Vuelve a arrancar 'active' directo porque las fotos (que acá no
+        // se tocan) ya habían pasado el chequeo de Cloud Vision la primera vez.
+        (resource.data.sellerId == request.auth.uid
+          && resource.data.status == 'ended'
+          && (resource.data.bidCount == null || resource.data.bidCount == 0)
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['status', 'currentPrice', 'currentBidderId', 'currentBidderName', 'bidCount', 'endsAt', 'durationTier', 'extendWindowMinutes', 'extendByMinutes'])
+          && request.resource.data.status == 'active'
+          && request.resource.data.currentPrice == resource.data.startingPrice
+          && request.resource.data.currentBidderId == null
+          && request.resource.data.bidCount == 0)
       );
-      allow delete: if request.auth != null && resource.data.sellerId == request.auth.uid;
+
+      // Solo se puede borrar una subasta propia si nunca tuvo ninguna puja
+      // — así no se puede usar para "borrar evidencia" de una operación ya
+      // cerrada con comprador y contacto revelado. Para una subasta con
+      // pujas, la única baja posible es cancelarla dentro de la ventana de
+      // arrepentimiento (ver más arriba) o dejar que cierre normalmente.
+      // Excepción: Susurro puede borrar cualquiera a mano (ej: pruebas
+      // viejas con pujas falsas que quedaron dando vueltas) — es una
+      // acción manual y deliberada, no algo que la limpieza automática
+      // haga sola, justamente para no debilitar la protección de arriba.
+      allow delete: if request.auth != null
+                    && ((resource.data.sellerId == request.auth.uid
+                         && (resource.data.bidCount == null || resource.data.bidCount == 0))
+                        || isSusurro());
 
       // Documento de contacto revelado por la Cloud Function al cerrar
       // una subasta con ganador. Solo lo pueden leer esas dos personas.
@@ -107,8 +170,24 @@ service cloud.firestore {
 
       allow create: if request.auth != null && (
         (request.auth.uid == userId &&
+          // "referredBy" solo se puede cargar acá, al crear la cuenta — nunca
+          // en un update (ver más abajo), así nadie se puede autoasignar un
+          // referido después ni cambiarlo (ver sorteo bounty, COMO-FUNCIONA.md).
+          // "hasBid" y los puntos de sorteo no están en ninguna lista: esos
+          // solo los toca el Admin SDK (Cloud Functions). "username"/
+          // "usernameChangedAt" están acá por una carrera rara: si alguien
+          // elige su nombre de usuario antes de que upsertUserProfile (es
+          // async) termine de crear el documento, updateUsername crea el
+          // documento de una — mismo chequeo de formato que en el update.
           request.resource.data.keys().hasOnly(
-            ['displayName', 'email', 'photoURL', 'phone', 'deliveryPreferences', 'createdAt', 'updatedAt']
+            ['displayName', 'email', 'photoURL', 'phone', 'deliveryPreferences', 'createdAt', 'referredBy', 'username', 'usernameChangedAt', 'updatedAt']
+          )
+          && (
+            !request.resource.data.keys().hasAny(['username', 'usernameChangedAt'])
+            ||
+            (request.resource.data.username is string
+              && request.resource.data.username.matches('^[A-Za-z0-9_]{3,30}$')
+              && request.resource.data.usernameChangedAt == request.time)
           ))
         ||
         isSusurro()
@@ -120,7 +199,24 @@ service cloud.firestore {
           // crear el documento (ver upsertUserProfile) — nunca en un update,
           // así nadie puede falsear después su fecha de registro.
           request.resource.data.diff(resource.data).affectedKeys().hasOnly(
-            ['displayName', 'email', 'photoURL', 'phone', 'deliveryPreferences', 'updatedAt']
+            ['displayName', 'email', 'photoURL', 'phone', 'deliveryPreferences', 'username', 'usernameChangedAt', 'updatedAt']
+          )
+          // Si se toca el nombre de usuario, se exige además: formato válido
+          // (3-30 caracteres, letras/números/guión bajo — debe coincidir con
+          // USERNAME_PATTERN en src/lib/users.js), que "usernameChangedAt"
+          // quede en el momento real del servidor (no un valor inventado por
+          // el cliente para simular que pasó más tiempo), y que hayan pasado
+          // 7 días desde el último cambio (o que nunca lo haya cambiado).
+          // Reforzado acá, no solo en el código, para que no se pueda
+          // saltear el enfriamiento escribiendo directo a Firestore.
+          && (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['username', 'usernameChangedAt'])
+            ||
+            (request.resource.data.username is string
+              && request.resource.data.username.matches('^[A-Za-z0-9_]{3,30}$')
+              && request.resource.data.usernameChangedAt == request.time
+              && (resource.data.get('usernameChangedAt', null) == null
+                  || request.time > resource.data.get('usernameChangedAt', null) + duration.value(7, 'd')))
           ))
         ||
         isSusurro()
@@ -129,12 +225,63 @@ service cloud.firestore {
           && request.auth.uid != userId
           && resource.data.email != 'theblackmarketconnections@gmail.com'
           && resource.data.role != 'arana'
+          // repNumerator/repDenominator/repOpsCount: puntaje de reputación
+          // (ver getReputationScore en lib/users.js) — se suman acá junto
+          // con el strike porque addStrike() los actualiza en el mismo
+          // setDoc. El dueño de la cuenta NUNCA puede tocarlos (no están en
+          // el allowlist de arriba de "allow update" para request.auth.uid
+          // == userId), así nadie se auto-mejora el puntaje.
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(
-            ['banned', 'bannedUntil', 'bannedAt', 'banReason', 'strikes']
+            ['banned', 'bannedUntil', 'bannedAt', 'banReason', 'strikes', 'repNumerator', 'repDenominator', 'repOpsCount']
           ))
       );
 
       allow delete: if isSusurro();
+    }
+
+    // Reserva de unicidad de nombres de usuario — el id del documento ES
+    // el nombre en minúsculas, así Firestore mismo impide que dos cuentas
+    // reserven el mismo (no se puede crear dos veces el mismo id). Ver
+    // updateUsername en src/lib/users.js: borra la reserva vieja y crea la
+    // nueva en una sola transacción junto con el cambio en users/{uid}.
+    match /usernames/{usernameId} {
+      allow read: if true; // para poder chequear disponibilidad antes de intentar guardar
+      allow create: if request.auth != null
+                    && request.resource.data.uid == request.auth.uid
+                    && usernameId.matches('^[a-z0-9_]{3,30}$');
+      allow delete: if request.auth != null && resource.data.uid == request.auth.uid;
+      allow update: if false; // nunca se "transfiere": se borra una y se crea otra
+    }
+
+    // "Mercado" (bazaar tipo grupo de compraventa): a diferencia de
+    // auctions, no hay puja ni cierre — el vendedor pone precio fijo y
+    // quien esté interesado ve directo su contacto (sellerPhone/sellerEmail
+    // quedan guardados en el propio documento, a propósito, para que la
+    // revelación sea inmediata — ver MarketListingDetail.jsx). Por eso la
+    // lectura exige estar logueado (no público del todo), mismo criterio ya
+    // aceptado en el resto del sitio para no exponer contactos a cualquiera
+    // sin cuenta.
+    match /marketListings/{listingId} {
+      allow read: if request.auth != null;
+
+      allow create: if request.auth != null
+                    && request.resource.data.sellerId == request.auth.uid
+                    && request.resource.data.status == 'active';
+
+      // El vendedor solo puede: completar "images" recién publicado (mismo
+      // patrón que auctions), o marcarla como vendida/reactivarla. Nunca
+      // cambiar precio/fotos/contacto en un update (para eso borra y
+      // publica de nuevo) — así no puede "cambiazo" una vez que alguien ya
+      // la vio con otro precio.
+      allow update: if request.auth != null && resource.data.sellerId == request.auth.uid && (
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['images'])
+        ||
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+          && (request.resource.data.status == 'sold' || request.resource.data.status == 'active'))
+      );
+
+      allow delete: if request.auth != null
+                    && (resource.data.sellerId == request.auth.uid || isStaff());
     }
 
     // Registro histórico de los sorteos mensuales. Lectura pública (por si
@@ -242,6 +389,57 @@ service cloud.firestore {
       allow update: if request.auth != null
                     && request.auth.uid == resource.data.userId
                     && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow delete: if false;
+    }
+
+    // Sorteo bounty: una carta puntual que Susurro sube y activa a mano
+    // (no es periódico como el sorteo mensual). Lectura pública porque se
+    // muestra en el home mientras está 'active'. Solo Susurro puede
+    // crearlo/activarlo/cerrarlo — ver src/lib/bountyRaffles.js.
+    match /bountyRaffles/{raffleId} {
+      allow read: if true;
+      allow create, update: if isSusurro();
+      allow delete: if false;
+
+      // Puntos extra por traer gente durante ESTE sorteo puntual. Nadie
+      // los escribe desde el cliente — solo las Cloud Functions de
+      // referidos (Admin SDK), al detectar un registro o una primera
+      // puja con `referredBy` cargado. Susurro los puede leer para armar
+      // el sorteo; el resto ni eso, para no revelar puntos ajenos.
+      match /entries/{uid} {
+        allow read: if isSusurro();
+        allow write: if false;
+      }
+    }
+
+    // "Workbench": catálogo propio de TBMC (impresiones 3D y otros
+    // productos a pedido, ver COMO-FUNCIONA.md) — a diferencia de Mercado,
+    // acá el catálogo lo arma solo Susurro (es el negocio propio del
+    // sitio, no algo que publique cualquier usuario). Lectura pública
+    // (incluso sin estar activo, para que Susurro lo vea en su propia
+    // vista de edición — el front filtra "active" para el resto).
+    match /workbenchProducts/{productId} {
+      allow read: if true;
+      allow create, update: if isSusurro();
+      allow delete: if isSusurro();
+    }
+
+    // Pedidos de "Crear/Craft" — texto libre de quien pide, más su
+    // contacto (igual que en Mercado, se guarda en el propio documento
+    // para que Susurro lo tenga a mano sin ir a buscarlo a users/{uid}).
+    // No hay pago ni webhook acá a propósito: Susurro coordina el precio y
+    // la entrega por fuera, como en el resto del sitio.
+    match /workbenchOrders/{orderId} {
+      allow read: if request.auth != null && (
+        request.auth.uid == resource.data.buyerId || isSusurro()
+      );
+      allow create: if request.auth != null
+                    && request.resource.data.buyerId == request.auth.uid
+                    && request.resource.data.status == 'pending';
+      // Solo Susurro cambia el estado (aceptado/rechazado/entregado) — el
+      // comprador no puede tocar su propio pedido una vez enviado.
+      allow update: if isSusurro()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'adminNote']);
       allow delete: if false;
     }
   }

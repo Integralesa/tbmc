@@ -1,14 +1,25 @@
 const { onSchedule } = require('firebase-functions/v2/scheduler')
-const { onDocumentUpdated } = require('firebase-functions/v2/firestore')
+const { onDocumentCreated, onDocumentUpdated } = require('firebase-functions/v2/firestore')
 const { onObjectFinalized } = require('firebase-functions/v2/storage')
 const { onRequest } = require('firebase-functions/v2/https')
+const { defineSecret } = require('firebase-functions/params')
 const { initializeApp } = require('firebase-admin/app')
-const { getFirestore, Timestamp } = require('firebase-admin/firestore')
+const { getFirestore, Timestamp, FieldValue } = require('firebase-admin/firestore')
+const { getStorage } = require('firebase-admin/storage')
 const vision = require('@google-cloud/vision')
 
 initializeApp()
 const db = getFirestore()
 const visionClient = new vision.ImageAnnotatorClient()
+
+// Token del bot de Telegram "El Rumor" y URL del webhook de Discord (canal
+// #anuncios) — guardados como secretos (Secret Manager), nunca en el
+// código ni en git (ver COMO-FUNCIONA.md, sección del Tablón de TBMC). Se
+// cargan con `firebase functions:secrets:set`.
+const TELEGRAM_BOT_TOKEN = defineSecret('TELEGRAM_BOT_TOKEN')
+const DISCORD_WEBHOOK_URL = defineSecret('DISCORD_WEBHOOK_URL')
+const TELEGRAM_CHANNEL = '@tablontbmc'
+const SITE_URL = 'https://theblackmarketconnections.com'
 
 /**
  * Corre cada 5 minutos: busca subastas activas cuyo endsAt ya pasó
@@ -97,6 +108,95 @@ exports.closeExpiredAuctions = onSchedule('every 5 minutes', async () => {
   }
 })
 
+// Cuánto tiempo se deja una subasta cerrada SIN pujas antes de borrarla
+// sola (ver cleanupOldAuctions). Las que sí tuvieron ganador NO se tocan
+// acá — quedan para siempre por si hace falta revisar un reclamo.
+const CLEANUP_AFTER_DAYS = 14
+
+// Los tres estados "cerrados sin venta" que se limpian solos, cada uno con
+// el campo de fecha que realmente usa (no es el mismo en los tres — ver
+// closeExpiredAuctions, closeAuctionByAdmin en lib/admin.js, y
+// cancelAuction en lib/auctions.js).
+const CLEANUP_STATUSES = [
+  { status: 'ended', dateField: 'closedAt' },
+  { status: 'closed_by_admin', dateField: 'adminClosedAt' },
+  { status: 'cancelled_by_seller', dateField: 'cancelledAt' },
+]
+
+/**
+ * Corre una vez por día: borra subastas cerradas SIN venta (sin pujas)
+ * que llevan más de CLEANUP_AFTER_DAYS días así — sea porque terminaron
+ * sin ganador, las cerró un admin, o las canceló el vendedor. No dejan
+ * contacto revelado ni handshake que consultar, así que no tiene sentido
+ * juntarlas para siempre — si no se limpian, se acumulan de a decenas en
+ * Firestore y sus fotos en Storage (ver COMO-FUNCIONA.md). Antes de
+ * borrar el documento, borra también sus fotos en Storage (carpeta
+ * auctions/{id}/) para no dejar basura ahí tampoco.
+ */
+exports.cleanupOldAuctions = onSchedule('every 24 hours', async () => {
+  const bucket = getStorage().bucket()
+  const cutoff = Timestamp.fromMillis(Date.now() - CLEANUP_AFTER_DAYS * 24 * 60 * 60 * 1000)
+
+  const results = await Promise.all(
+    CLEANUP_STATUSES.map(({ status, dateField }) =>
+      db.collection('auctions').where('status', '==', status).where(dateField, '<=', cutoff).get(),
+    ),
+  )
+
+  const toDelete = results.flatMap((snap) => snap.docs).filter((docSnap) => !(docSnap.data().bidCount > 0))
+
+  if (toDelete.length === 0) {
+    console.log('No hay subastas viejas sin pujas para borrar.')
+    return
+  }
+
+  // Antes de borrar fotos de Storage: un bug viejo (ya arreglado) de
+  // "Republicar" llegó a crear subastas nuevas cuyas fotos en realidad
+  // viven en la carpeta de OTRA subasta (la original, de antes del
+  // arreglo) en vez de en la propia — esto pasó de verdad y causó que se
+  // rompieran fotos de subastas activas al borrarse la huérfana que
+  // "dueña" la carpeta (ver COMO-FUNCIONA.md). Por eso, antes de borrar
+  // la carpeta auctions/{id}/ de alguien que se está yendo, nos fijamos
+  // si alguna OTRA subasta que NO se está borrando ahora todavía
+  // referencia esa misma carpeta en su campo `images` — si es así, se
+  // salta el borrado de Storage (el documento huérfano sí se borra
+  // igual, pero sus fotos no, para no romper una subasta que sigue viva).
+  const toDeleteIds = new Set(toDelete.map((d) => d.id))
+  const allSnap = await db.collection('auctions').select('images').get()
+  const folderIdsStillInUse = new Set()
+  allSnap.docs.forEach((d) => {
+    if (toDeleteIds.has(d.id)) return
+    const images = d.data().images || []
+    images.forEach((url) => {
+      const match = url.match(/auctions%2F([^%/]+)%2F/)
+      if (match) folderIdsStillInUse.add(match[1])
+    })
+  })
+
+  let skippedStorage = 0
+  for (const docSnap of toDelete) {
+    if (folderIdsStillInUse.has(docSnap.id)) {
+      skippedStorage++
+      console.log(`${docSnap.id}: otra subasta todavía usa esas fotos — no se borran de Storage.`)
+      continue
+    }
+    try {
+      await bucket.deleteFiles({ prefix: `auctions/${docSnap.id}/` })
+    } catch (err) {
+      console.error(`No se pudieron borrar las fotos de ${docSnap.id}:`, err)
+    }
+  }
+
+  const batch = db.batch()
+  toDelete.forEach((docSnap) => batch.delete(docSnap.ref))
+  await batch.commit()
+
+  console.log(
+    `Borré ${toDelete.length} subasta(s) cerrada(s) sin venta de hace más de ${CLEANUP_AFTER_DAYS} días` +
+      (skippedStorage > 0 ? ` (${skippedStorage} sin tocar sus fotos, por seguir en uso).` : '.'),
+  )
+})
+
 /**
  * Cada vez que alguna de las partes marca su propia confirmación o reporte
  * de problema (el cliente solo puede tocar sus propios campos, ver
@@ -126,6 +226,25 @@ exports.recomputeDealStatus = onDocumentUpdated(
 
     if (after.dealStatus !== newStatus) {
       await event.data.after.ref.update({ dealStatus: newStatus })
+
+      // Reputación (ver getReputationScore en src/lib/users.js): solo al
+      // transitar A 'completed' (nunca si ya estaba 'completed' y se
+      // recalcula de nuevo), para no sumar puntos dos veces. Vendedor pesa
+      // más que pujador porque concretar una venta implica más compromiso
+      // real (fotos, entrega) que solo pagar una puja ganada.
+      if (newStatus === 'completed' && after.sellerId && after.winnerId) {
+        const inc = FieldValue.increment
+        await Promise.all([
+          db.collection('users').doc(after.sellerId).set(
+            { repNumerator: inc(5 * 1.0), repDenominator: inc(1.0), repOpsCount: inc(1) },
+            { merge: true },
+          ),
+          db.collection('users').doc(after.winnerId).set(
+            { repNumerator: inc(5 * 0.2), repDenominator: inc(0.2), repOpsCount: inc(1) },
+            { merge: true },
+          ),
+        ])
+      }
     }
   },
 )
@@ -460,6 +579,50 @@ exports.checkAuctionPhoto = onObjectFinalized({ region: 'us-east1' }, async (eve
 })
 
 /**
+ * Avisa en el canal de Telegram "El Tablón de TBMC" (@tablontbmc, posteado
+ * por el bot "El Rumor") cada vez que una subasta recién publicada termina
+ * de pasar el chequeo de fotos y queda 'active' — sea automático (Cloud
+ * Vision, ver checkAuctionPhoto) o aprobada a mano por Susurro/Araña
+ * (approvePendingAuction). Solo mira la transición 'pending_review' →
+ * 'active', a propósito: así NO avisa de nuevo cuando se "Republica" una
+ * subasta vieja ('ended' → 'active'), que no es una publicación nueva de
+ * verdad — evita mandar 14 avisos seguidos si alguien republica una tanda.
+ */
+exports.notifyTelegramOnNewAuction = onDocumentUpdated(
+  { document: 'auctions/{auctionId}', secrets: [TELEGRAM_BOT_TOKEN, DISCORD_WEBHOOK_URL] },
+  async (event) => {
+    const before = event.data.before.data()
+    const after = event.data.after.data()
+    if (!before || !after) return
+    if (before.status !== 'pending_review' || after.status !== 'active') return
+
+    const price = after.currentPrice ?? after.startingPrice ?? 0
+    const link = `${SITE_URL}/subasta/${event.params.auctionId}`
+    const text = `🆕 Nuevo en El Tablón\n\n${after.title}\n💰 $${Number(price).toLocaleString('es-AR')}\n\n${link}`
+
+    const [telegramResult, discordResult] = await Promise.allSettled([
+      fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN.value()}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: TELEGRAM_CHANNEL, text }),
+      }),
+      fetch(DISCORD_WEBHOOK_URL.value(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: text, username: 'El Rumor' }),
+      }),
+    ])
+
+    if (telegramResult.status === 'rejected' || !telegramResult.value?.ok) {
+      console.error('No se pudo avisar por Telegram:', telegramResult.reason || telegramResult.value?.status)
+    }
+    if (discordResult.status === 'rejected' || !discordResult.value?.ok) {
+      console.error('No se pudo avisar por Discord:', discordResult.reason || discordResult.value?.status)
+    }
+  },
+)
+
+/**
  * API pública de solo lectura: nombre y precio actual de las subastas
  * activas, en JSON — pensada para que otro sitio pueda mostrar/enlazar
  * las cartas en venta sin tener que meterse a leer Firestore directo.
@@ -489,4 +652,80 @@ exports.publicAuctionsFeed = onRequest(async (req, res) => {
     console.error('Error en publicAuctionsFeed:', err)
     res.status(500).json({ error: 'No se pudo obtener la lista de subastas.' })
   }
+})
+
+// Puntos que suma quien invitó, por evento — ver sección "Sorteo bounty" en
+// COMO-FUNCIONA.md. Solo se acreditan mientras hay un sorteo bounty activo:
+// no se acumulan para siempre, cada sorteo arranca de cero.
+const REFERRAL_SIGNUP_POINTS = 1
+const REFERRAL_FIRST_BID_POINTS = 2
+
+/** Busca el sorteo bounty activo ahora mismo, o null si no hay ninguno. */
+async function getActiveBountyRaffleId() {
+  const snap = await db.collection('bountyRaffles').where('status', '==', 'active').limit(1).get()
+  return snap.empty ? null : snap.docs[0].id
+}
+
+/**
+ * Suma puntos al referente en bountyRaffles/{id}/entries/{referrerUid} —
+ * subcolección aparte de la lista de usuarios, así que un usuario nunca
+ * puede tocar sus propios puntos escribiendo directo a Firestore (ver
+ * firestore.rules: esa subcolección es de solo lectura para el cliente).
+ */
+async function awardReferralPoints(referrerUid, points, referrerName) {
+  const raffleId = await getActiveBountyRaffleId()
+  if (!raffleId) return // no hay sorteo corriendo — no se acredita nada
+  const entryRef = db.collection('bountyRaffles').doc(raffleId).collection('entries').doc(referrerUid)
+  await entryRef.set(
+    { points: FieldValue.increment(points), userName: referrerName || null },
+    { merge: true },
+  )
+}
+
+/**
+ * Se dispara al crear cualquier cuenta nueva. Si vino invitada (campo
+ * `referredBy`, cargado una sola vez por el propio cliente al crearse el
+ * documento — ver upsertUserProfile en src/lib/users.js), le suma puntos
+ * de sorteo a quien la invitó.
+ */
+exports.awardReferralSignupBonus = onDocumentCreated('users/{uid}', async (event) => {
+  const newUser = event.data.data()
+  const referrerUid = newUser.referredBy
+  if (!referrerUid || referrerUid === event.params.uid) return // no autoinvitarse
+
+  const referrerSnap = await db.collection('users').doc(referrerUid).get()
+  if (!referrerSnap.exists) return
+
+  await awardReferralPoints(referrerUid, REFERRAL_SIGNUP_POINTS, referrerSnap.data().displayName)
+})
+
+/**
+ * Se dispara con cada puja nueva. Además de marcar `hasBid: true` en el
+ * perfil de quien pujó (usado para el contador de "gente pujando" en
+ * /admin), si es su PRIMERA puja de siempre y vino invitada, le suma
+ * puntos extra a quien la invitó — bonus más grande que el de registrarse
+ * solo, para premiar más a quien trae gente que realmente participa.
+ */
+exports.awardReferralBidBonus = onDocumentCreated('bids/{bidId}', async (event) => {
+  const bid = event.data.data()
+  const bidderId = bid.userId
+  if (!bidderId) return
+
+  const bidderRef = db.collection('users').doc(bidderId)
+
+  const { isFirstBid, referrerUid } = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(bidderRef)
+    if (!snap.exists) return { isFirstBid: false, referrerUid: null }
+    const data = snap.data()
+    if (data.hasBid) return { isFirstBid: false, referrerUid: null }
+    tx.update(bidderRef, { hasBid: true })
+    return { isFirstBid: true, referrerUid: data.referredBy || null }
+  })
+
+  if (!isFirstBid || !referrerUid) return
+
+  const referrerSnap = await db.collection('users').doc(referrerUid).get()
+  if (!referrerSnap.exists) return
+
+  await awardReferralPoints(referrerUid, REFERRAL_FIRST_BID_POINTS, referrerSnap.data().displayName)
 })
