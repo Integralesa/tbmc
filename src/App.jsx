@@ -41,7 +41,7 @@ export default function App() {
           <Route path="/mercado/:id" element={<MarketListingDetail />} />
           <Route path="/workbench" element={<Workbench />} />
           <Route path="/workbench/:id" element={<WorkbenchProductDetail />} />
-          <Route path="/buscar" element={<SearchWishlist />} />
+          <Route path="/wishlist" element={<SearchWishlist />} />
           <Route path="/perfil" element={<Profile />} />
           <Route path="/terminos" element={<Terms />} />
           <Route path="/privacidad" element={<Privacy />} />

@@ -10,6 +10,10 @@ export default function SearchWishlist() {
   const [publicWishlists, setPublicWishlists] = useState([])
   const [isLoading, setIsLoading] = useState(false)
   const [activeTab, setActiveTab] = useState('search')
+  const [selectedGame, setSelectedGame] = useState('pokemon')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchSetCode, setSearchSetCode] = useState('')
+  const [searchNumber, setSearchNumber] = useState('')
 
   useEffect(() => {
     const init = async () => {
@@ -143,6 +147,56 @@ export default function SearchWishlist() {
     setCards(cards.filter((_, i) => i !== index))
   }
 
+  const handleAddCard = async () => {
+    if (!searchQuery.trim()) {
+      alert('Ingresa el nombre de la carta')
+      return
+    }
+    if (!searchSetCode.trim()) {
+      alert('Ingresa el código del set')
+      return
+    }
+    if (!searchNumber.trim()) {
+      alert('Ingresa el número de la carta')
+      return
+    }
+
+    setIsLoading(true)
+    try {
+      // Validar que la carta exista
+      const cardExists = await validateCard(searchQuery, searchSetCode, searchNumber)
+      if (!cardExists) {
+        alert('Carta no encontrada. Verifica nombre, set y número.')
+        setIsLoading(false)
+        return
+      }
+
+      const newCard = {
+        name: searchQuery,
+        quantity: 1,
+        setCode: searchSetCode,
+        cardNumber: searchNumber,
+        added: new Date(),
+      }
+
+      setCards([...cards, newCard])
+      setSearchQuery('')
+      setSearchSetCode('')
+      setSearchNumber('')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const validateCard = async (name, setCode, number) => {
+    // Placeholder: validar si la carta existe
+    // Luego integrar con APIs específicas (Scryfall para Magic, pokemontcg para Pokémon)
+    if (name.length > 0 && setCode.length > 0 && number.length > 0) {
+      return true
+    }
+    return false
+  }
+
   const updateQuantity = (index, newQuantity) => {
     if (newQuantity <= 0) {
       removeCard(index)
@@ -156,10 +210,99 @@ export default function SearchWishlist() {
   return (
     <div className="max-w-5xl mx-auto px-6 py-10">
       <div className="mb-8">
-        <h1 className="font-serif text-4xl text-parchment mb-2">Buscar Cartas</h1>
+        <h1 className="font-serif text-4xl text-parchment mb-2">Wishlist</h1>
         <p className="text-muted">
-          Pega una lista de Limitless o tu wishlist, y nosotros te avisamos cuando salgan.
+          Crea tu wishlist y te notificamos cuando salgan las cartas que buscas.
         </p>
+      </div>
+
+      {/* Selector de juego */}
+      <div className="flex gap-2 mb-8 border-b border-panelLine">
+        <button
+          onClick={() => setSelectedGame('pokemon')}
+          className={`px-4 py-3 text-sm font-medium transition-colors ${
+            selectedGame === 'pokemon'
+              ? 'text-brass border-b-2 border-brass -mb-[2px]'
+              : 'text-parchment/60 hover:text-parchment'
+          }`}
+        >
+          Pokémon TCG
+        </button>
+        <button
+          onClick={() => setSelectedGame('magic')}
+          className={`px-4 py-3 text-sm font-medium transition-colors ${
+            selectedGame === 'magic'
+              ? 'text-brass border-b-2 border-brass -mb-[2px]'
+              : 'text-parchment/60 hover:text-parchment'
+          }`}
+        >
+          Magic: The Gathering
+        </button>
+      </div>
+
+      {/* Método 1: Búsqueda Individual */}
+      {selectedGame === 'pokemon' && (
+        <div className="mb-8 p-6 bg-panel border border-panelLine">
+          <h2 className="text-lg text-parchment mb-4 font-serif">Buscar Carta Individual</h2>
+          <div className="space-y-3">
+            <div>
+              <label className="block text-xs text-muted mb-1">Nombre de la carta</label>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Ej: Pikachu, Charizard EX"
+                className="w-full bg-ink border border-panelLine px-3 py-2 text-parchment placeholder:text-muted/60 focus:border-brass outline-none text-sm"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-muted mb-1">Set (código)</label>
+                <input
+                  type="text"
+                  value={searchSetCode}
+                  onChange={(e) => setSearchSetCode(e.target.value.toUpperCase())}
+                  placeholder="Ej: PBL, TWM"
+                  maxLength="4"
+                  className="w-full bg-ink border border-panelLine px-3 py-2 text-parchment placeholder:text-muted/60 focus:border-brass outline-none text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-muted mb-1">Número</label>
+                <input
+                  type="text"
+                  value={searchNumber}
+                  onChange={(e) => setSearchNumber(e.target.value)}
+                  placeholder="Ej: 36, 123"
+                  className="w-full bg-ink border border-panelLine px-3 py-2 text-parchment placeholder:text-muted/60 focus:border-brass outline-none text-sm"
+                />
+              </div>
+            </div>
+            <button
+              onClick={handleAddCard}
+              disabled={isLoading}
+              className="w-full px-4 py-2 bg-brass text-ink font-medium hover:bg-brassHigh transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+            >
+              <FiClipboard size={16} />
+              Agregar Carta
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Método 2: Paste Clipboard */}
+      <div className="mb-8 p-6 bg-panel border border-panelLine">
+        <h2 className="text-lg text-parchment mb-4 font-serif">
+          {selectedGame === 'pokemon' ? 'Pegar Lista de Limitless' : 'Pegar Lista de Moxfield'}
+        </h2>
+        <button
+          onClick={handlePasteFromClipboard}
+          disabled={isLoading}
+          className="px-6 py-3 bg-brass text-ink font-medium hover:bg-brassHigh transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+        >
+          <FiClipboard size={18} />
+          Pegar del clipboard
+        </button>
       </div>
 
       {/* Tabs */}

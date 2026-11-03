@@ -21,8 +21,8 @@ export default function Navbar() {
       <Link to="/" onClick={() => setMenuOpen(false)} className={linkClass}>
         Subastas
       </Link>
-      <Link to="/buscar" onClick={() => setMenuOpen(false)} className={linkClass}>
-        Buscar
+      <Link to="/wishlist" onClick={() => setMenuOpen(false)} className={linkClass}>
+        Wishlist
       </Link>
       {isStaff(user, profile) && (
         <Link
